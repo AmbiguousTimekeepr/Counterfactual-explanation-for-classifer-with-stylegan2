@@ -29,13 +29,10 @@ class CelebAClassifierDataset(Dataset):
         if attr_file.endswith('.csv'):
             df = pd.read_csv(attr_file)
         else:
-            # Try reading with no header, then set columns manually
             df = pd.read_csv(attr_file, delim_whitespace=True, header=None)
-            # First column is image filename, rest are attributes
             if len(df.columns) == len(self.selected_attributes) + 1:
                 df.columns = ['image_id'] + self.selected_attributes
             else:
-                # Try reading with header=1 (old logic)
                 df = pd.read_csv(attr_file, delim_whitespace=True, header=1)
                 if 'index' in df.columns:
                     df = df.reset_index()
@@ -45,19 +42,28 @@ class CelebAClassifierDataset(Dataset):
 
         available_imgs = set(os.listdir(images_dir))
         if 'image_id' not in df.columns:
-            # Try fallback to first column
             df['image_id'] = df[df.columns[0]]
         self.df = df[df['image_id'].isin(available_imgs)].copy()
+        
+        # **SAFEGUARD: Reorder columns by selected_attributes to ensure alignment**
+        missing_attrs = [attr for attr in self.selected_attributes if attr not in self.df.columns]
+        if missing_attrs:
+            raise ValueError(f"Missing attributes in CSV: {missing_attrs}")
         self.df = self.df[['image_id'] + self.selected_attributes]
+        
         for attr in self.selected_attributes:
             self.df[attr] = (self.df[attr] + 1) // 2
-    def __len__(self): return len(self.df)
+            
+    def __len__(self):
+        return len(self.df)
+        
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         img_path = os.path.join(self.images_dir, row['image_id'])
         image = Image.open(img_path).convert('RGB')
         if self.transform:
             image = self.transform(image)
+        # **SAFEGUARD: Labels in selected_attributes order**
         labels = torch.tensor(row[self.selected_attributes].values.astype(np.float32))
         return image, labels
 
@@ -104,6 +110,63 @@ class ExplainableClassifier(nn.Module):
         self.target_layer.register_full_backward_hook(save_grad(self.target_layer_name))
     def forward(self, x):
         return self.model(x)
+
+def load_attributes_by_name(attr_file, image_names, attribute_names, img_id_col=None):
+    """
+    Load attributes from CSV/file and reorder by attribute_names to ensure alignment.
+    
+    Args:
+        attr_file: Path to attribute CSV
+        image_names: List of image filenames to extract
+        attribute_names: List of attribute names in desired order
+        img_id_col: Column name for image ID (auto-detect if None)
+    
+    Returns:
+        dict: {image_name: torch.Tensor of shape (len(attribute_names),)}
+    """
+    if attr_file.endswith('.csv'):
+        df = pd.read_csv(attr_file)
+    else:
+        df = pd.read_csv(attr_file, delim_whitespace=True, header=None)
+        if len(df.columns) == len(attribute_names) + 1:
+            df.columns = ['image_id'] + attribute_names
+        else:
+            df = pd.read_csv(attr_file, delim_whitespace=True, header=1)
+            if 'index' in df.columns:
+                df = df.reset_index()
+                df.rename(columns={'index': 'image_id'}, inplace=True)
+            elif df.columns[0] not in ['image_id', 'image']:
+                df.rename(columns={df.columns[0]: 'image_id'}, inplace=True)
+    
+    # Auto-detect image ID column
+    if img_id_col is None:
+        if 'image_id' in df.columns:
+            img_id_col = 'image_id'
+        elif 'image' in df.columns:
+            img_id_col = 'image'
+        else:
+            img_id_col = df.columns[0]
+    
+    # **SAFEGUARD: Reorder columns by attribute_names**
+    missing_attrs = [attr for attr in attribute_names if attr not in df.columns]
+    if missing_attrs:
+        raise ValueError(f"Missing attributes in {attr_file}: {missing_attrs}")
+    
+    df = df[[img_id_col] + attribute_names]
+    
+    # Normalize attribute values: convert -1/1 to 0/1
+    for attr in attribute_names:
+        df[attr] = (df[attr] + 1) // 2
+    
+    result = {}
+    for img_name in image_names:
+        rows = df[df[img_id_col] == img_name]
+        if len(rows) > 0:
+            row = rows.iloc[0]
+            attrs = torch.tensor(row[attribute_names].values.astype(np.float32))
+            result[img_name] = attrs
+    
+    return result
 
 def load_trained_model(model_path, model_name, num_classes=39, attribute_names=CELEBA_39_ATTRIBUTES, device=None):
     """

@@ -1,0 +1,128 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class LatentMutator(nn.Module):
+    """
+    Single-Vector Latent Mutator with Statistical IG Guidance.
+    Optimized for memory efficiency and theoretical robustness.
+    """
+    def __init__(self, embed_dim=64, num_attributes=40, num_levels=3):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_attributes = num_attributes
+        self.num_levels = num_levels
+
+        # 1. Single Learned Direction per Attribute
+        # We learn ONE vector d_i. The sign is computed mathematically based on (target - prediction).
+        self.directions = nn.Parameter(torch.randn(num_attributes, embed_dim) * 0.10)
+
+        # 2. Step Size Predictor (IG Stats -> Scalar Step)
+        # Input: 8 statistical features + 8 context features (from latent mean) = 16 dims
+        self.input_dim = 8 + embed_dim 
+        
+        # Shared feature extractor for efficiency
+        self.shared_mlp = nn.Sequential(
+            nn.Linear(self.input_dim, 64),
+            nn.LayerNorm(64),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(64, 64),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+        
+        # Per-level heads to allow different edit strengths for Top/Mid/Bottom
+        self.heads = nn.ModuleList([
+            nn.Sequential(nn.Linear(64, 32), nn.LeakyReLU(0.2), nn.Linear(32, 1), nn.Softplus()) 
+            for _ in range(num_levels)
+        ])
+
+    def get_ig_features(self, ig_map):
+        """
+        Extracts 8 statistical features from the IG spatial map [B, H, W]
+        """
+        # Flatten spatial dims: [B, H*W]
+        flat = ig_map.view(ig_map.size(0), -1).abs()
+        
+        # 1. Mean Intensity
+        f_mean = flat.mean(dim=1, keepdim=True)
+        # 2. Max Intensity
+        f_max = flat.max(dim=1, keepdim=True).values
+        # 3. Std Dev
+        f_std = flat.std(dim=1, keepdim=True)
+        # 4. Positive Ratio (Assuming input is abs, checking > 0 isn't useful, 
+        # so we check 'significant' attribution > 1e-4)
+        f_pos = (flat > 1e-4).float().mean(dim=1, keepdim=True)
+        # 5. 90th Quantile
+        f_q90 = torch.quantile(flat, 0.9, dim=1, keepdim=True)
+        # 6. 10th Quantile
+        f_q10 = torch.quantile(flat, 0.1, dim=1, keepdim=True)
+        # 7. Hotspot Ratio (pixels > 95% of max)
+        # Note: using max() per sample for threshold
+        threshold = flat.max(dim=1, keepdim=True).values * 0.95
+        f_hotspot = (flat > threshold).float().mean(dim=1, keepdim=True)
+        # 8. Entropy (Spatial Concentration)
+        # Normalize to prob dist
+        probs = flat / (flat.sum(dim=1, keepdim=True) + 1e-8)
+        f_entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=1, keepdim=True)
+
+        # Concat: [B, 8]
+        return torch.cat([f_mean, f_max, f_std, f_pos, f_q90, f_q10, f_hotspot, f_entropy], dim=1)
+
+    def forward(self, z_list, ig_map, cam_masks, target_vector, current_probs, active_attr_idx):
+        """
+        Args:
+            z_list: List of latents [z_top, z_mid, z_bot]
+            ig_map: Integrated Gradients map [B, 128, 128] (aggregated spatial)
+            cam_masks: List of masks resized to [8x8, 16x16, 32x32]
+            target_vector: Target binary labels [B, 40]
+            current_probs: Current predictions [B, 40]
+            active_attr_idx: The single attribute index we are currently editing (int)
+        """
+        batch_size = z_list[0].size(0)
+        z_mutated = [z.clone() for z in z_list]
+        
+        # 1. Calculate Direction Sign
+        # If Target=1, Prob=0.1 -> Diff=0.9 (Pos) -> Add direction
+        # If Target=0, Prob=0.9 -> Diff=-0.9 (Neg) -> Subtract direction
+        # We process only the 'active_attr_idx' to save compute
+        target = target_vector[:, active_attr_idx]
+        prob = current_probs[:, active_attr_idx]
+        sign = torch.sign(target - prob).view(batch_size, 1, 1, 1) # [B, 1, 1, 1]
+        
+        # 2. Get Direction Vector
+        direction = F.normalize(self.directions[active_attr_idx], dim=0).view(1, -1, 1, 1) # [1, C, 1, 1]
+
+        # 3. Calculate Step Size (Intensity)
+        # Get IG stats [B, 8]
+        ig_stats = self.get_ig_features(ig_map)
+        
+        # Get Context from Top Level Latent (Global Info)
+        # Pool z_top [B, C, 8, 8] -> [B, C]
+        context = z_list[0].mean(dim=[2, 3]) 
+        
+        # Combine: [B, 8+C]
+        step_input = torch.cat([ig_stats, context], dim=1)
+        
+        # Shared features
+        features = self.shared_mlp(step_input)
+
+        # 4. Apply Mutation Per Level
+        for i, z in enumerate(z_list):
+            # Predict step for this level
+            step = self.heads[i](features).view(batch_size, 1, 1, 1) # [B, 1, 1, 1]
+            
+            # Mask (Locality)
+            mask = cam_masks[i].unsqueeze(1) # [B, 1, H, W]
+            
+            # OVERRIDE: Force huge step size and ignore mask for debugging
+            step = torch.full_like(step, 5.0)
+            mask = torch.ones_like(mask)
+            
+            # Calculate Delta
+            # delta = sign * step * direction * mask
+            delta = sign * step * direction * mask
+            
+            # Add to latent
+            z_mutated[i] = z + delta
+
+        return z_mutated

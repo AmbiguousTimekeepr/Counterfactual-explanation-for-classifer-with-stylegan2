@@ -72,11 +72,21 @@ class Config(VQVAEConfig):
         # ============================================================================
         # Decoder Pretraining Settings
         # ============================================================================
-        self.decoder_pretrain_epochs = 0
+        self.decoder_pretrain_epochs = 10
         self.decoder_lr = 1e-3
         self.decoder_betas = (0.0, 0.99)
-        self.decoder_checkpoint_dir = "outputs/stylegan_decoder"
+        self.decoder_checkpoint_dir = "outputs/synth_network/stylegan_decoder"
         self.decoder_checkpoint_path = ""
+        
+        # ============================================================================
+        # Decoder Sharpening Settings
+        # ============================================================================   
+        self.sharpening_epochs = 20
+        self.g_sharpening_lr = 2e-4
+        self.d_sharpening_lr = 1e-5
+        self.sharpening_betas = (0.0, 0.99)
+        self.sharpening_checkpoint_dir = "outputs/synth_network/stylegan_decoder_sharpened"
+        
         
     @classmethod
     def from_args(cls):
@@ -87,7 +97,7 @@ class Config(VQVAEConfig):
         parser.add_argument('--num_epochs', type=int, default=50, help='Number of epochs')
         parser.add_argument('--vqvae_path', type=str, default='outputs/checkpoints_production/best_model.pth')
         parser.add_argument('--classifier_path', type=str, default='outputs/trained_classifiers(0512)/best_model.pth')
-        parser.add_argument('--data_root', type=str, default='Dataset/celeba_70percent_721')
+        parser.add_argument('--data_root', type=str, default='Dataset/celeba_70percent_721/train')
         
         args = parser.parse_args()
         

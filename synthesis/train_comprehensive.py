@@ -56,8 +56,8 @@ class ComprehensiveTrainer:
         
     def setup_directories(self):
         """Create output directories"""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.exp_dir = Path(f"outputs/experiments/{self.experiment_name}_{timestamp}")
+        timestamp = datetime.now().strftime("%Y%m%d")
+        self.exp_dir = Path(f"outputs/synth_network/CF_generator/{self.experiment_name}_{timestamp}")
         self.exp_dir.mkdir(parents=True, exist_ok=True)
         
         self.checkpoint_dir = self.exp_dir / "checkpoints"

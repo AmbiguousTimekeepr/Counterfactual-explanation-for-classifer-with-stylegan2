@@ -69,103 +69,67 @@ class HierarchicalSynthesisNet(nn.Module):
     def __init__(self, style_dim=512, latent_dim=64):
         super().__init__()
         self.style_dim = style_dim
-        
-        # A. Mapping Network (Top Latent -> Style w)
-        # We assume Top Latent (8x8) contains global identity info
-        self.mapping = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(latent_dim, style_dim),
-            nn.LeakyReLU(0.2),
-            nn.Linear(style_dim, style_dim),
-            nn.LeakyReLU(0.2)
-        )
-        
-        # B. Constant Input (4x4)
-        self.const_input = nn.Parameter(torch.randn(1, 512, 4, 4))
-        
-        # C. Synthesis Blocks
-        # 4x4 Block (Const + Style)
-        self.conv1 = ModulatedConv2d(512, 512, style_dim=style_dim)
-        self.to_rgb1 = ToRGB(512, style_dim)
-        
-        # 8x8 Block (Upsample + Inject Mid + Conv)
-        self.conv2 = ModulatedConv2d(512, 512, style_dim=style_dim)
-        self.injector_mid = nn.Conv2d(latent_dim, 512, 1) # Adapts 16x16/8x8 latent to features
-        self.to_rgb2 = ToRGB(512, style_dim)
-        
-        # 16x16 Block
-        self.conv3 = ModulatedConv2d(512, 512, style_dim=style_dim)
-        # Usually Mid (16x16) fits best here naturally
-        self.to_rgb3 = ToRGB(512, style_dim)
-        
-        # 32x32 Block (Inject Bottom)
-        self.conv4 = ModulatedConv2d(512, 256, style_dim=style_dim)
-        self.injector_bot = nn.Conv2d(latent_dim, 512, 1)  # Match channel count before addition
-        self.to_rgb4 = ToRGB(256, style_dim)
-        
-        # 64x64 Block
-        self.conv5 = ModulatedConv2d(256, 128, style_dim=style_dim)
-        self.to_rgb5 = ToRGB(128, style_dim)
-        
-        # 128x128 Block
-        self.conv6 = ModulatedConv2d(128, 64, style_dim=style_dim)
-        self.to_rgb6 = ToRGB(64, style_dim)
 
-    def forward(self, z_list):
-        """
-        z_list: [z_top(8x8), z_mid(16x16), z_bot(32x32)]
-        """
+        layers = [nn.AdaptiveAvgPool2d(1), nn.Flatten()]
+        in_features = latent_dim
+        for _ in range(6):
+            layers.append(nn.Linear(in_features, style_dim))
+            layers.append(nn.LeakyReLU(0.2, inplace=True))
+            in_features = style_dim
+        self.mapping = nn.Sequential(*layers)
+
+        self.input_projector = nn.Sequential(
+            nn.Conv2d(latent_dim, 512, kernel_size=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.InstanceNorm2d(512)
+        )
+
+        self.conv_8 = ModulatedConv2d(512, 512, style_dim=style_dim)
+        self.to_rgb_8 = ToRGB(512, style_dim)
+
+        self.conv_16 = ModulatedConv2d(512, 512, style_dim=style_dim)
+        self.inj_mid = nn.Conv2d(latent_dim, 512, 1)
+        self.to_rgb_16 = ToRGB(512, style_dim)
+
+        self.conv_32 = ModulatedConv2d(512, 256, style_dim=style_dim)
+        self.inj_bot = nn.Conv2d(latent_dim, 512, 1)
+        self.to_rgb_32 = ToRGB(256, style_dim)
+
+        self.conv_64 = ModulatedConv2d(256, 128, style_dim=style_dim)
+        self.to_rgb_64 = ToRGB(128, style_dim)
+
+        self.conv_128 = ModulatedConv2d(128, 64, style_dim=style_dim)
+        self.to_rgb_128 = ToRGB(64, style_dim)
+
+    def forward(self, z_list, masks=None):
         z_t, z_m, z_b = z_list
-        batch = z_t.size(0)
-        
-        # 1. Generate Style 'w' from Top Level (Identity)
-        w = self.mapping(z_t) # [B, 512]
-        
-        # 2. 4x4 (Start)
-        x = self.const_input.repeat(batch, 1, 1, 1)
-        x = self.conv1(x, w)
-        rgb = self.to_rgb1(x, w)
-        
-        # 3. 8x8 (Upsample -> Inject Mid? -> Conv)
-        x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False) # 8x8
-        rgb = F.interpolate(rgb, scale_factor=2, mode='bilinear', align_corners=False)
-        
-        # Injection: User requested "Mid-level VQ (16x16)" at 8x8 block
-        # We downsample z_mid to 8x8 to add it
-        feat_mid = self.injector_mid(z_m) # [B, 512, 16, 16]
-        feat_mid_8 = F.interpolate(feat_mid, size=(8,8), mode='area') # Downsample to match
-        x = x + feat_mid_8 # Injection
-        
-        x = self.conv2(x, w)
-        rgb = rgb + self.to_rgb2(x, w)
-        
-        # 4. 16x16
-        x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False) # 16x16
-        rgb = F.interpolate(rgb, scale_factor=2, mode='bilinear', align_corners=False)
-        # (Could inject z_mid here again naturally, but sticking to user plan)
-        x = self.conv3(x, w)
-        rgb = rgb + self.to_rgb3(x, w)
-        
-        # 5. 32x32 (Inject Bottom)
-        x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False) # 32x32
-        rgb = F.interpolate(rgb, scale_factor=2, mode='bilinear', align_corners=False)
-        
-        feat_bot = self.injector_bot(z_b) # [B, 512, 32, 32]
-        x = x + feat_bot
-        x = self.conv4(x, w)
-        rgb = rgb + self.to_rgb4(x, w)
-        
-        # 6. 64x64
+        w = self.mapping(z_t)
+
+        x = self.input_projector(z_t)
+
+        x = self.conv_8(x, w)
+        rgb = self.to_rgb_8(x, w)
+
         x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)
         rgb = F.interpolate(rgb, scale_factor=2, mode='bilinear', align_corners=False)
-        x = self.conv5(x, w)
-        rgb = rgb + self.to_rgb5(x, w)
-        
-        # 7. 128x128
+        x = x + self.inj_mid(z_m)
+        x = self.conv_16(x, w)
+        rgb = rgb + self.to_rgb_16(x, w)
+
         x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)
         rgb = F.interpolate(rgb, scale_factor=2, mode='bilinear', align_corners=False)
-        x = self.conv6(x, w)
-        rgb = rgb + self.to_rgb6(x, w)
-        
+        x = x + self.inj_bot(z_b)
+        x = self.conv_32(x, w)
+        rgb = rgb + self.to_rgb_32(x, w)
+
+        x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)
+        rgb = F.interpolate(rgb, scale_factor=2, mode='bilinear', align_corners=False)
+        x = self.conv_64(x, w)
+        rgb = rgb + self.to_rgb_64(x, w)
+
+        x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)
+        rgb = F.interpolate(rgb, scale_factor=2, mode='bilinear', align_corners=False)
+        x = self.conv_128(x, w)
+        rgb = rgb + self.to_rgb_128(x, w)
+
         return torch.tanh(rgb) # [-1, 1]

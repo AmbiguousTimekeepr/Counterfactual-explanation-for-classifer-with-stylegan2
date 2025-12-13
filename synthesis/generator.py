@@ -40,7 +40,7 @@ class CounterfactualGenerator(nn.Module):
         for p in self.vqvae.parameters():
             p.requires_grad = False
 
-        self.classifier = ResNet50_CBAM(num_classes=40).to(device)
+        self.classifier = ResNet50_CBAM(num_classes=cfg.num_classes).to(device)
 
         clf_ckpt = torch.load(classifier_path, map_location=device)
         if isinstance(clf_ckpt, dict):
@@ -67,24 +67,55 @@ class CounterfactualGenerator(nn.Module):
         for p in self.classifier.parameters():
             p.requires_grad = False
 
-        self.mutator = LatentMutator(embed_dim=cfg.embed_dim, num_attributes=40).to(device)
         self.decoder = HierarchicalSynthesisNet(style_dim=512, latent_dim=64).to(device)
 
-        decoder_ckpt_path = getattr(cfg, 'decoder_checkpoint_path', None)
-        if decoder_ckpt_path:
-            ckpt_path = Path(decoder_ckpt_path)
-            if ckpt_path.is_file():
-                self.decoder.load_state_dict(torch.load(ckpt_path, map_location=device))
-                print(f"🧭 Loaded StyleGAN decoder weights from {ckpt_path}")
+        sharpen_candidates = []
+        sharpen_path = getattr(cfg, "sharpened_decoder_path", None)
+        if sharpen_path:
+            sharpen_candidates.append(Path(sharpen_path))
+
+        sharpen_root = Path(getattr(cfg, "sharpening_checkpoint_dir", "outputs/synth_network/stylegan_decoder_sharpened"))
+        latest_sharp = sharpen_root / "latest_sharp.pth"
+        if latest_sharp.is_file():
+            sharpen_candidates.append(latest_sharp)
+        if sharpen_root.is_dir():
+            epoch_ckpts = sorted(sharpen_root.glob("sharp_epoch_*.pth"), reverse=True)
+            sharpen_candidates.extend(epoch_ckpts)
+
+        decoder_loaded = False
+        for candidate in sharpen_candidates:
+            if candidate.is_file():
+                print(f"🔄 Loading Sharpened StyleGAN decoder from {candidate}...")
+                state_dict = torch.load(candidate, map_location=device)
+                self.decoder.load_state_dict(state_dict)
+                decoder_loaded = True
+                break
+
+        if not decoder_loaded:
+            decoder_ckpt_path = getattr(cfg, "decoder_checkpoint_path", None)
+            if decoder_ckpt_path:
+                ckpt_path = Path(decoder_ckpt_path)
+                if ckpt_path.is_file():
+                    print(f"🔍 Falling back to decoder weights at {ckpt_path}")
+                    self.decoder.load_state_dict(torch.load(ckpt_path, map_location=device))
+                    decoder_loaded = True
+                else:
+                    print(f"⚠️ Decoder checkpoint not found at {ckpt_path}; starting with random weights.")
             else:
-                print(f"⚠️ Decoder checkpoint not found at {ckpt_path}; starting with random weights.")
+                print("⚠️ No sharpened decoder path provided; starting with random weights.")
+
+        for p in self.decoder.parameters():
+            p.requires_grad = False
+
+        self.mutator = LatentMutator(embed_dim=cfg.embed_dim, num_attributes=cfg.num_attributes).to(device)
 
     def re_quantize(self, z, quantizer):
         """Standard quantization"""
         z_perm = z.permute(0, 2, 3, 1).contiguous()
-        dist = torch.cdist(z_perm.view(-1, z.shape[1]), quantizer.embedding)
+        flat_z = z_perm.view(-1, z.shape[1])
+        dist = torch.cdist(flat_z, quantizer.embedding.float())
         indices = torch.argmin(dist, dim=1)
-        z_q = quantizer.embedding(indices).view(z_perm.shape)
+        z_q = torch.nn.functional.embedding(indices, quantizer.embedding).view(z_perm.shape)
         z_q = z_perm + (z_q - z_perm).detach()
         return z_q.permute(0, 3, 1, 2).contiguous()
 
@@ -102,7 +133,7 @@ class CounterfactualGenerator(nn.Module):
 
         # B. Mutate
         # The Mutator uses the IG/CAM guidance to modify the latents
-        z_mutated = self.mutator(z_list, ig_map, cam_masks, target_vec, current_probs, attr_idx)
+        z_mutated, step_values = self.mutator(z_list, ig_map, cam_masks, target_vec, current_probs, attr_idx)
         
         # C. Re-Quantize (Optional based on 'hard' flag)
         if hard:
@@ -119,4 +150,4 @@ class CounterfactualGenerator(nn.Module):
         # in specific regions by the Mutator.
         img_out = self.decoder(z_final)
         
-        return img_out, z_mutated
+        return img_out, z_mutated, step_values

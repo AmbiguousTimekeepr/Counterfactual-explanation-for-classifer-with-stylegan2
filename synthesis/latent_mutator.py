@@ -12,29 +12,23 @@ class LatentMutator(nn.Module):
         self.embed_dim = embed_dim
         self.num_attributes = num_attributes
         self.num_levels = num_levels
-
-        # 1. Single Learned Direction per Attribute
-        # We learn ONE vector d_i. The sign is computed mathematically based on (target - prediction).
         self.directions = nn.Parameter(torch.randn(num_attributes, embed_dim) * 0.10)
 
-        # 2. Step Size Predictor (IG Stats -> Scalar Step)
-        # Input: 8 statistical features + 8 context features (from latent mean) = 16 dims
-        self.input_dim = 8 + embed_dim 
-        
-        # Shared feature extractor for efficiency
-        self.shared_mlp = nn.Sequential(
-            nn.Linear(self.input_dim, 64),
-            nn.LayerNorm(64),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(64, 64),
-            nn.LeakyReLU(0.2, inplace=True)
-        )
-        
-        # Per-level heads to allow different edit strengths for Top/Mid/Bottom
-        self.heads = nn.ModuleList([
-            nn.Sequential(nn.Linear(64, 32), nn.LeakyReLU(0.2), nn.Linear(32, 1), nn.Softplus()) 
-            for _ in range(num_levels)
-        ])
+        self.step_predictors = nn.ModuleList()
+        for _ in range(num_attributes):
+            predictor = nn.Sequential(
+                nn.Linear(embed_dim + 8, 128),
+                nn.LayerNorm(128),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.Linear(128, 96),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.Linear(96, 64),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.Linear(64, num_levels),
+                nn.Softplus()
+            )
+            predictor[-2].bias.data.fill_(10.0)
+            self.step_predictors.append(predictor)
 
     def get_ig_features(self, ig_map):
         """
@@ -74,12 +68,13 @@ class LatentMutator(nn.Module):
             z_list: List of latents [z_top, z_mid, z_bot]
             ig_map: Integrated Gradients map [B, 128, 128] (aggregated spatial)
             cam_masks: List of masks resized to [8x8, 16x16, 32x32]
-            target_vector: Target binary labels [B, 40]
-            current_probs: Current predictions [B, 40]
+            target_vector: Target binary labels [B, num_attributes]
+            current_probs: Current predictions [B, num_attributes]
             active_attr_idx: The single attribute index we are currently editing (int)
         """
         batch_size = z_list[0].size(0)
         z_mutated = [z.clone() for z in z_list]
+        step_values = []
         
         # 1. Calculate Direction Sign
         # If Target=1, Prob=0.1 -> Diff=0.9 (Pos) -> Add direction
@@ -95,34 +90,19 @@ class LatentMutator(nn.Module):
         # 3. Calculate Step Size (Intensity)
         # Get IG stats [B, 8]
         ig_stats = self.get_ig_features(ig_map)
-        
-        # Get Context from Top Level Latent (Global Info)
-        # Pool z_top [B, C, 8, 8] -> [B, C]
-        context = z_list[0].mean(dim=[2, 3]) 
-        
-        # Combine: [B, 8+C]
-        step_input = torch.cat([ig_stats, context], dim=1)
-        
-        # Shared features
-        features = self.shared_mlp(step_input)
 
-        # 4. Apply Mutation Per Level
+        context = z_list[0].mean(dim=[2, 3])
+        step_input = torch.cat([context, ig_stats], dim=1)
+
+        step_logits = self.step_predictors[active_attr_idx](step_input)
+
         for i, z in enumerate(z_list):
-            # Predict step for this level
-            step = self.heads[i](features).view(batch_size, 1, 1, 1) # [B, 1, 1, 1]
-            
-            # Mask (Locality)
-            mask = cam_masks[i].unsqueeze(1) # [B, 1, H, W]
-            
-            # OVERRIDE: Force huge step size and ignore mask for debugging
-            step = torch.full_like(step, 5.0)
-            mask = torch.ones_like(mask)
-            
-            # Calculate Delta
-            # delta = sign * step * direction * mask
+            step = step_logits[:, i].view(batch_size, 1, 1, 1)
+            step_values.append(step)
+
+            mask = cam_masks[i].unsqueeze(1)
+
             delta = sign * step * direction * mask
-            
-            # Add to latent
             z_mutated[i] = z + delta
 
-        return z_mutated
+        return z_mutated, step_values

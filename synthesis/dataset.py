@@ -8,6 +8,22 @@ import numpy as np
 from PIL import Image
 
 
+SELECTED_ATTRIBUTES = [
+    'Bald',
+    'Bangs',
+    'Black_Hair',
+    'Blond_Hair',
+    'Brown_Hair',
+    'Bushy_Eyebrows',
+    'Eyeglasses',
+    'Male',
+    'Mouth_Slightly_Open',
+    'Mustache',
+    'Pale_Skin',
+    'Young',
+]
+
+
 class CelebADataset(Dataset):
     """
     CelebA dataset loader with attribute annotations
@@ -34,7 +50,7 @@ class CelebADataset(Dataset):
             root_dir: Path to CelebA root directory
             split: 'train', 'val', or 'test'
             image_size: Target image size (e.g., 128)
-            num_attributes: Number of attributes (default 40 for CelebA)
+            num_attributes: Original argument preserved for compatibility (ignored; SELECTED_ATTRIBUTES used)
             transform: Image transforms
             return_filename: Whether to return filename in __getitem__
             use_eval_partition: If True, use list_eval_partition.csv for splits
@@ -42,7 +58,12 @@ class CelebADataset(Dataset):
         self.root_dir = Path(root_dir)
         self.split = split
         self.image_size = image_size
-        self.num_attributes = num_attributes
+        if num_attributes not in (None, len(SELECTED_ATTRIBUTES)):
+            print(
+                f"Warning: overriding requested num_attributes={num_attributes} "
+                f"with len(SELECTED_ATTRIBUTES)={len(SELECTED_ATTRIBUTES)}"
+            )
+        self.num_attributes = len(SELECTED_ATTRIBUTES)
         self.return_filename = return_filename
         self.use_eval_partition = use_eval_partition
         
@@ -62,16 +83,17 @@ class CelebADataset(Dataset):
         # First column is typically the image filename
         self.image_names = df.iloc[:, 0].values.tolist()
         
-        # Attribute names from columns (skip first column which is index/filename)
-        self.attr_names = df.columns[1:num_attributes+1].tolist()
-        
+        # Attribute names restricted to SELECTED_ATTRIBUTES
+        available_attrs = set(df.columns[1:])
+        missing_attrs = [attr for attr in SELECTED_ATTRIBUTES if attr not in available_attrs]
+        if missing_attrs:
+            raise ValueError(f"Missing required attributes in CSV: {missing_attrs}")
+
+        self.attr_names = SELECTED_ATTRIBUTES
+
         # Get attribute values [convert -1 to 0, keep 1 as 1]
-        self.attributes = []
-        for idx in range(len(df)):
-            attrs = df.iloc[idx, 1:num_attributes+1].values.astype(np.int32)
-            # Convert from [-1, 1] to [0, 1]
-            attrs = (attrs + 1) // 2
-            self.attributes.append(attrs)
+        attrs_matrix = df[self.attr_names].replace(-1, 0).astype(np.int32).values
+        self.attributes = [row for row in attrs_matrix]
         
         # Split dataset
         if use_eval_partition:
@@ -227,14 +249,5 @@ def get_loader(cfg, split='train', batch_size=None, num_workers=None, shuffle=No
 
 
 def get_attribute_names():
-    """Get standard CelebA 40 attribute names"""
-    return [
-        '5_o_Clock_Shadow', 'Arched_Eyebrows', 'Attractive', 'Bags_Under_Eyes',
-        'Bald', 'Bangs', 'Big_Lips', 'Big_Nose', 'Black_Hair', 'Blond_Hair',
-        'Blurry', 'Brown_Hair', 'Bushy_Eyebrows', 'Chubby', 'Double_Chin',
-        'Eyeglasses', 'Goatee', 'Gray_Hair', 'Heavy_Makeup', 'High_Cheekbones',
-        'Male', 'Mouth_Slightly_Open', 'Mustache', 'Narrow_Eyes', 'No_Beard',
-        'Oval_Face', 'Pale_Skin', 'Pointy_Nose', 'Receding_Hairline', 'Rosy_Cheeks',
-        'Sideburns', 'Smiling', 'Straight_Hair', 'Stubble', 'Sunglass',
-        'Sweating', 'Thick_Lips', 'Thin_Lips', 'Wearing_Earrings', 'Young'
-    ]
+    """Get the restricted CelebA attribute names used by this project"""
+    return SELECTED_ATTRIBUTES

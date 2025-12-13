@@ -17,7 +17,7 @@ import torchvision.utils as vutils
 from .config import Config
 from .generator import CounterfactualGenerator
 from .loss_functions import CounterfactualLossManager
-from .dataset import CelebADataset, get_loader
+from .dataset import CelebADataset, get_loader, get_attribute_names
 from .visualizer import CounterfactualVisualizer
 
 
@@ -40,6 +40,10 @@ class ComprehensiveTrainer:
         # Initialize models
         self.init_models()
         
+        # Attribute name mapping (restricted CelebA subset)
+        self.attr_names = self._get_attribute_names()
+        self._initialize_active_attributes()
+
         # Setup logging
         self.setup_logging()
         
@@ -50,8 +54,6 @@ class ComprehensiveTrainer:
         self.global_step = 0
         self.best_loss = float('inf')
         
-        # Attribute name mapping (CelebA 40 attributes)
-        self.attr_names = self._get_attribute_names()
         self.decoder_pretrained = False
         
     def setup_directories(self):
@@ -108,6 +110,20 @@ class ComprehensiveTrainer:
             if getattr(self.cfg, 'decoder_pretrain_epochs', 0) > 0:
                 print("ℹ️ No decoder checkpoint supplied; decoder will be trained from scratch.")
     
+    def _initialize_active_attributes(self):
+        """Derive active attribute indices based on configuration."""
+        desired_attrs = getattr(self.cfg, 'active_attributes', None)
+        if desired_attrs:
+            missing = [attr for attr in desired_attrs if attr not in self.attr_names]
+            if missing:
+                raise ValueError(f"Unknown attributes in config.active_attributes: {missing}")
+            self.active_attr_names = list(desired_attrs)
+        else:
+            self.active_attr_names = list(self.attr_names)
+
+        self.active_attr_indices = [self.attr_names.index(name) for name in self.active_attr_names]
+        print(f"🎯 Active synthesis attributes ({len(self.active_attr_indices)}): {', '.join(self.active_attr_names)}")
+
     def setup_logging(self):
         """Setup Tensorboard and CSV logging"""
         self.writer = SummaryWriter(str(self.log_dir))
@@ -116,28 +132,24 @@ class ComprehensiveTrainer:
         self.csv_path = self.log_dir / "training_log.csv"
         self.csv_file = open(self.csv_path, 'w', newline='')
         
+        attr_fields = [f"attr_{self.attr_names[idx]}_cf_loss" for idx in self.active_attr_indices]
+
         fieldnames = [
             'epoch', 'batch', 'step', 'total_loss',
             'cf_loss', 'retention_loss', 'latent_prox_loss',
-            'ortho_loss', 'sparse_loss', 'lr'
-        ] + [f'attr_{i}_cf_loss' for i in range(40)]
+            'ortho_loss', 'sparse_loss', 'lr',
+            'embed_orig_top', 'embed_orig_mid', 'embed_orig_bot',
+            'embed_cf_top', 'embed_cf_mid', 'embed_cf_bot',
+            'step_top', 'step_mid', 'step_bot'
+        ] + attr_fields
         
         self.csv_writer = csv.DictWriter(self.csv_file, fieldnames=fieldnames)
         self.csv_writer.writeheader()
         self.csv_file.flush()
         
     def _get_attribute_names(self):
-        """Get CelebA attribute names"""
-        return [
-            '5_o_Clock_Shadow', 'Arched_Eyebrows', 'Attractive', 'Bags_Under_Eyes',
-            'Bald', 'Bangs', 'Big_Lips', 'Big_Nose', 'Black_Hair', 'Blond_Hair',
-            'Blurry', 'Brown_Hair', 'Bushy_Eyebrows', 'Chubby', 'Double_Chin',
-            'Eyeglasses', 'Goatee', 'Gray_Hair', 'Heavy_Makeup', 'High_Cheekbones',
-            'Male', 'Mouth_Slightly_Open', 'Mustache', 'Narrow_Eyes', 'No_Beard',
-            'Oval_Face', 'Pale_Skin', 'Pointy_Nose', 'Receding_Hairline', 'Rosy_Cheeks',
-            'Sideburns', 'Smiling', 'Straight_Hair', 'Stubble', 'Sunglass',
-            'Sweating', 'Thick_Lips', 'Thin_Lips', 'Wearing_Earrings', 'Young'
-        ]
+        """Get active CelebA attribute names"""
+        return get_attribute_names()
     
     def train_epoch(self, epoch, loader):
         """Train for one epoch with comprehensive logging"""
@@ -147,21 +159,23 @@ class ComprehensiveTrainer:
             'total': [], 'cf': [], 'retention': [], 'latent_prox': [],
             'ortho': [], 'sparse': []
         }
-        attr_losses = {i: [] for i in range(40)}
+        attr_losses = {i: [] for i in self.active_attr_indices}
         
         pbar = tqdm(loader, desc=f"Epoch {epoch} / {self.cfg.num_epochs}")
         accumulation_steps = self.cfg.accumulation_steps
         
         for batch_idx, (images, labels) in enumerate(pbar):
             images = images.to(self.device)
-            labels = labels.to(self.device)  # [B, 40]
+            labels = labels.to(self.device)
             
             # --- Random attribute selection ---
-            attr_idx = random.randint(0, 39)
+            attr_idx = random.choice(self.active_attr_indices)
             target_labels = labels.clone()
             target_labels[:, attr_idx] = 1 - target_labels[:, attr_idx]
             
-            # --- 2. XAI Extraction (Fixed with Smoothing) ---
+            # ====================================================
+            # 1. XAI Extraction (Smoothed & Robust)
+            # ====================================================
             images.requires_grad = True
             self.model.classifier.zero_grad()
 
@@ -169,67 +183,70 @@ class ComprehensiveTrainer:
             target_score = logits[:, attr_idx].sum()
             grads = torch.autograd.grad(target_score, images, create_graph=False)[0]
 
-            raw_saliency = torch.abs(images * grads).sum(dim=1)
             with torch.no_grad():
-                smooth_mask = F.avg_pool2d(raw_saliency.unsqueeze(1), kernel_size=15, stride=1, padding=7)
+                raw_saliency = torch.abs(images * grads).sum(dim=1)
+                saliency_unsqueezed = raw_saliency.unsqueeze(1)
+                smooth_mask = F.avg_pool2d(saliency_unsqueezed, kernel_size=7, stride=1, padding=3)
+
                 flat = smooth_mask.view(smooth_mask.size(0), -1)
                 max_val = flat.max(dim=1, keepdim=True)[0].view(-1, 1, 1, 1)
                 mask_norm = smooth_mask / (max_val + 1e-8)
-                cam_128 = (mask_norm > 0.2).float().squeeze(1)
+                cam_128 = (mask_norm > 0.05).float().squeeze(1)
 
-                mask_t = F.interpolate(cam_128.unsqueeze(1), size=(8, 8)).squeeze(1)
-                mask_m = F.interpolate(cam_128.unsqueeze(1), size=(16, 16)).squeeze(1)
-                mask_b = F.interpolate(cam_128.unsqueeze(1), size=(32, 32)).squeeze(1)
+                mask_t = F.interpolate(cam_128.unsqueeze(1), size=(8, 8), mode='bilinear', align_corners=False).squeeze(1)
+                mask_m = F.interpolate(cam_128.unsqueeze(1), size=(16, 16), mode='bilinear', align_corners=False).squeeze(1)
+                mask_b = F.interpolate(cam_128.unsqueeze(1), size=(32, 32), mode='bilinear', align_corners=False).squeeze(1)
                 masks = [mask_t, mask_m, mask_b]
                 probs = torch.sigmoid(logits.detach())
 
             images.requires_grad = False
-            
+
             with torch.no_grad():
                 z_orig_list = self.model.vqvae.get_codes(images)
-            
+
+            # ====================================================
+            # 2. Forward Pass (Curriculum Learning)
+            # ====================================================
             with autocast():
                 use_hard = (epoch >= 5)
 
-                x_new, z_mutated = self.model(
+                x_new, z_mutated, step_values = self.model(
                     images,
-                    raw_saliency.detach(),
+                    raw_saliency,
                     masks,
                     target_labels,
                     probs,
                     attr_idx,
                     hard=use_hard
                 )
-                # === DEBUG PROBE START ===
-                # if batch_idx % 10 == 0:
-                #     print(f"\n--- DEBUG STEP {self.global_step} ---")
-                #     print(f"GRAD MAX: {grads.abs().max().item():.6f}")
-                #     if grads.abs().max() < 1e-6:
-                #         print("⚠️ CRITICAL: Gradients are zero! XAI is blind.")
-                #     print(f"MASK MEAN: {masks[1].mean().item():.4f} | MAX: {masks[1].max().item():.4f}")
-                #     with torch.no_grad():
-                #         diff = (x_new - images).abs().mean().item()
-                #     print(f"IMG DIFF: {diff:.6f}")
-                #     if diff < 1e-4:
-                #         print("⚠️ CRITICAL: Output image is identical to Input! Decoder disconnected.")
-                #     else:
-                #         print("✅ Image is changing (Signal is flowing)")
-                # === DEBUG PROBE END ===
+
                 new_logits = self.model.classifier(x_new)
-                
-                # Loss computation
-                flip_mask = torch.ones(labels.size(0), 40, device=self.device)
+
+                flip_mask = torch.zeros_like(labels)
+                flip_mask[:, attr_idx] = 1.0
+
                 losses = self.loss_manager.generator_loss(
                     images, x_new,
                     new_logits, target_labels, probs,
                     flip_mask,
-                    z_orig_list, z_mutated,  # ✅ Now passes actual z_orig_list
+                    z_orig_list, z_mutated,
                     masks,
-                    self.model.mutator.directions
+                    self.model.mutator.directions,
+                    weights=self._get_dynamic_loss_weights(epoch)
                 )
-                
+
                 total_loss = losses['total'] / accumulation_steps
             
+            if getattr(self.cfg, 'vis_interval', 1) and epoch % max(1, self.cfg.vis_interval) == 0 and batch_idx == 0:
+                self._save_training_visualization(
+                    epoch,
+                    batch_idx,
+                    images,
+                    x_new,
+                    raw_saliency,
+                    attr_idx
+                )
+
             # --- Backward pass ---
             self.scaler.scale(total_loss).backward()
             
@@ -244,6 +261,9 @@ class ComprehensiveTrainer:
                     epoch_losses[key].append(losses[key].item())
                 
                 attr_losses[attr_idx].append(losses['cf'].item())
+
+                embed_log = self._prepare_embedding_log(z_orig_list, z_mutated, step_values)
+                self._log_step(epoch, batch_idx, losses, attr_idx, embed_log)
                 
                 # Update progress bar
                 pbar.set_postfix({
@@ -253,15 +273,65 @@ class ComprehensiveTrainer:
                 })
             
             # Memory cleanup
-            del x_new, new_logits, grads, raw_saliency, losses
+            del x_new, new_logits, grads, raw_saliency, losses, step_values, z_mutated, z_orig_list
             torch.cuda.empty_cache()
         
         # Log epoch summary
         self._log_epoch_summary(epoch, epoch_losses, attr_losses)
         
         return {k: np.mean(v) for k, v in epoch_losses.items()}
+
+    def _save_training_visualization(self, epoch, batch_idx, images, cf_batch, saliency_map, attr_idx):
+        """Save training-time inference visualization for the first sample in the batch."""
+        train_vis_dir = self.vis_dir / "train_snapshots"
+        train_vis_dir.mkdir(exist_ok=True)
+
+        img_sample = images[:1].detach()
+        saliency_sample = saliency_map[:1].detach()
+
+        with torch.no_grad():
+            pred_probs = torch.sigmoid(self.model.classifier(img_sample))
+            pred_binary = (pred_probs > 0.5).float()
+
+        cf_results = self._generate_counterfactuals(img_sample, pred_binary, num_cf=3)
+
+        primary_cf = {
+            'image': cf_batch[:1].detach().cpu(),
+            'attr_idx': attr_idx,
+            'attr_name': self.attr_names[attr_idx],
+            'ig_map': saliency_sample.squeeze(0).cpu(),
+            'cam_overlay': (saliency_sample.squeeze(0) > 0.05).float().cpu()
+        }
+
+        if cf_results['cfs']:
+            cf_results['cfs'][0] = primary_cf
+        else:
+            cf_results['cfs'].append(primary_cf)
+
+        fig = self.visualizer.create_comparison_grid(
+            img_sample.cpu(),
+            cf_results,
+            pred_binary.cpu(),
+            self.attr_names,
+            active_indices=self.active_attr_indices,
+            active_names=self.active_attr_names
+        )
+
+        save_path = train_vis_dir / f'epoch_{epoch:03d}_batch_{batch_idx:04d}.png'
+        fig.savefig(save_path, dpi=150, bbox_inches='tight')
+        self.writer.add_figure('Training/Inference', fig, self.global_step)
+        plt.close(fig)
     
-    def _log_step(self, epoch, batch_idx, losses, attr_idx):
+    def _get_dynamic_loss_weights(self, epoch):
+        base_weights = self.loss_manager.base_weights
+        dynamic = base_weights.copy()
+        dynamic['cf'] = base_weights['cf'] * 2.0
+        if epoch < 10:
+            dynamic['retention'] = 0.0
+            dynamic['latent_prox'] = 0.0
+        return dynamic
+
+    def _log_step(self, epoch, batch_idx, losses, attr_idx, embedding_info):
         """Log per-step metrics"""
         self.writer.add_scalar('Loss/total', losses['total'].item(), self.global_step)
         self.writer.add_scalar('Loss/cf', losses['cf'].item(), self.global_step)
@@ -281,12 +351,41 @@ class ComprehensiveTrainer:
             'ortho_loss': losses['ortho'].item(),
             'sparse_loss': losses['sparse'].item(),
             'lr': self.optimizer.param_groups[0]['lr'],
-            'learning_rate': self.optimizer.param_groups[0]['lr']
+            'embed_orig_top': embedding_info['orig'][0],
+            'embed_orig_mid': embedding_info['orig'][1],
+            'embed_orig_bot': embedding_info['orig'][2],
+            'embed_cf_top': embedding_info['cf'][0],
+            'embed_cf_mid': embedding_info['cf'][1],
+            'embed_cf_bot': embedding_info['cf'][2],
+            'step_top': embedding_info['steps'][0],
+            'step_mid': embedding_info['steps'][1],
+            'step_bot': embedding_info['steps'][2]
         }
         
         self.csv_writer.writerow(row)
         self.csv_file.flush()
     
+    def _prepare_embedding_log(self, z_orig_list, z_mutated_list, step_values):
+        """Prepare compact embedding summaries and step magnitudes for CSV logging."""
+        embed_orig = []
+        embed_cf = []
+        for z_orig, z_cf in zip(z_orig_list, z_mutated_list):
+            orig_vec = z_orig[0].detach().float().mean(dim=(1, 2)).cpu().tolist()
+            cf_vec = z_cf[0].detach().float().mean(dim=(1, 2)).cpu().tolist()
+            embed_orig.append(json.dumps(orig_vec))
+            embed_cf.append(json.dumps(cf_vec))
+
+        steps = []
+        for step in step_values:
+            step_scalar = float(step[0].detach().float().item())
+            steps.append(step_scalar)
+
+        return {
+            'orig': embed_orig,
+            'cf': embed_cf,
+            'steps': steps
+        }
+
     def _log_epoch_summary(self, epoch, epoch_losses, attr_losses):
         """Log per-epoch summary"""
         print(f"\n{'='*60}")
@@ -300,7 +399,8 @@ class ComprehensiveTrainer:
         
         # Per-attribute loss summary
         attr_means = {}
-        for attr_idx, losses in attr_losses.items():
+        for attr_idx in self.active_attr_indices:
+            losses = attr_losses.get(attr_idx, [])
             if losses:
                 mean = np.mean(losses)
                 attr_means[attr_idx] = mean
@@ -308,13 +408,13 @@ class ComprehensiveTrainer:
                 if mean < 0.5:
                     print(f"  {attr_name}: {mean:.4f}")
         
-        # Save per-attribute stats
+        # Save per-attribute stats for active attributes only
         attr_stats = {
-            self.attr_names[i]: {
-                'mean_loss': float(attr_means.get(i, -1)),
-                'num_updates': len(attr_losses[i])
+            self.attr_names[idx]: {
+                'mean_loss': float(attr_means.get(idx, -1)),
+                'num_updates': len(attr_losses.get(idx, []))
             }
-            for i in range(40)
+            for idx in self.active_attr_indices
         }
         
         with open(self.log_dir / f'attr_stats_epoch_{epoch}.json', 'w') as f:
@@ -323,120 +423,161 @@ class ComprehensiveTrainer:
     def validate_and_visualize(self, epoch, loader, num_samples=4):
         """Generate visualizations during validation"""
         self.model.mutator.eval()
-        
+
         print(f"\n🎨 Generating visualizations for epoch {epoch}...")
-        
+
+        inference_dir = self.vis_dir / "validation"
+        inference_dir.mkdir(exist_ok=True)
+
         vis_count = 0
-        for images, labels in loader:
-            if vis_count >= num_samples:
-                break
-            
-            images = images.to(self.device)
-            labels = labels.to(self.device)
-            
-            batch_size = images.size(0)
-            for sample_idx in range(batch_size):
+        with torch.no_grad():
+            for images, labels in loader:
                 if vis_count >= num_samples:
                     break
-                
-                img = images[sample_idx:sample_idx+1]
-                lbl = labels[sample_idx:sample_idx+1]
-                
-                # Generate 3 counterfactuals with different attributes
-                cf_results = self._generate_counterfactuals(img, lbl, num_cf=3)
-                
-                # Visualize
-                fig = self.visualizer.create_comparison_grid(
-                    img, cf_results, lbl, self.attr_names
-                )
-                
-                fig.savefig(
-                    self.vis_dir / f'epoch_{epoch:03d}_sample_{vis_count:03d}.png',
-                    dpi=150, bbox_inches='tight'
-                )
-                
-                self.writer.add_figure(
-                    f'Counterfactuals/sample_{vis_count}',
-                    fig,
-                    epoch
-                )
-                
-                vis_count += 1
-        
-        print(f"✅ Saved {vis_count} visualizations")
-    
+
+                images = images.to(self.device)
+                labels = labels.to(self.device)
+
+                batch_size = images.size(0)
+                for sample_idx in range(batch_size):
+                    if vis_count >= num_samples:
+                        break
+
+                    img = images[sample_idx:sample_idx + 1]
+                    lbl = labels[sample_idx:sample_idx + 1]
+
+                    cf_results = self._generate_counterfactuals(img, lbl, num_cf=3)
+                    fig = self.visualizer.create_comparison_grid(
+                        img.cpu(),
+                        cf_results,
+                        lbl.cpu(),
+                        self.attr_names,
+                        active_indices=self.active_attr_indices,
+                        active_names=self.active_attr_names
+                    )
+
+                    fig.savefig(
+                        inference_dir / f'epoch_{epoch:03d}_sample_{vis_count:03d}.png',
+                        dpi=150,
+                        bbox_inches='tight'
+                    )
+                    self.writer.add_figure(
+                        f'Validation/sample_{vis_count}',
+                        fig,
+                        epoch
+                    )
+                    plt.close(fig)
+                    vis_count += 1
+
+        self.model.mutator.train()
+        print(f"🖼️ Validation samples logged: {vis_count}")
+
     def plot_inference(self, loader, epoch, num_samples=4):
-        """Plot inference results"""
+        """Render inference samples for qualitative tracking."""
         if loader is None:
             return
+
         self.model.mutator.eval()
         inference_dir = self.vis_dir / "inference"
         inference_dir.mkdir(exist_ok=True)
+
         data_iter = iter(loader)
         vis_count = 0
+
         while vis_count < num_samples:
             try:
                 images, labels = next(data_iter)
             except StopIteration:
                 break
+
             images = images.to(self.device)
             labels = labels.to(self.device)
+
             batch_size = images.size(0)
             for sample_idx in range(batch_size):
                 if vis_count >= num_samples:
                     break
-                img = images[sample_idx:sample_idx+1]
-                lbl = labels[sample_idx:sample_idx+1]
+
+                img = images[sample_idx:sample_idx + 1]
+                lbl = labels[sample_idx:sample_idx + 1]
+
                 cf_results = self._generate_counterfactuals(img, lbl, num_cf=3)
                 fig = self.visualizer.create_comparison_grid(
-                    img, cf_results, lbl, self.attr_names
+                    img.cpu(),
+                    cf_results,
+                    lbl.cpu(),
+                    self.attr_names,
+                    active_indices=self.active_attr_indices,
+                    active_names=self.active_attr_names
                 )
+
                 fig.savefig(
                     inference_dir / f'epoch_{epoch:03d}_sample_{vis_count:03d}.png',
-                    dpi=150, bbox_inches='tight'
+                    dpi=150,
+                    bbox_inches='tight'
                 )
                 self.writer.add_figure(
                     f'Inference/sample_{vis_count}',
                     fig,
                     epoch
                 )
+                plt.close(fig)
                 vis_count += 1
+
         self.model.mutator.train()
         print(f"🖼️ Inference plots saved: {vis_count}")
 
     def _generate_counterfactuals(self, img, labels, num_cf=3):
-        results = {'original': img.cpu(), 'cfs': []}
+        results = {'original': img.detach().cpu(), 'cfs': []}
 
         with torch.no_grad():
             probs = torch.sigmoid(self.model.classifier(img))
 
-        for cf_idx in range(num_cf):
-            attr_idx = random.randint(0, 39)
+        for _ in range(num_cf):
+            attr_idx = random.choice(self.active_attr_indices)
             target_labels = labels.clone()
             target_labels[:, attr_idx] = 1 - target_labels[:, attr_idx]
 
             with torch.enable_grad():
-                img_grad = img.clone().detach()
-                img_grad.requires_grad = True
+                img_grad = img.clone().detach().requires_grad_(True)
                 logits = self.model.classifier(img_grad)
                 target_score = logits[:, attr_idx].sum()
                 grads = torch.autograd.grad(target_score, img_grad, create_graph=False)[0]
                 ig_map = torch.abs(img_grad * grads).sum(dim=1)
+                max_vals = ig_map.view(ig_map.size(0), -1).max(dim=1)[0].view(-1, 1, 1)
+                ig_map = ig_map / (max_vals + 1e-8)
+                ig_map = ig_map.detach()
 
             with torch.no_grad():
                 cam_128 = ig_map
-                mask_t = F.interpolate(cam_128.unsqueeze(1), size=(8, 8)).squeeze(1)
-                mask_m = F.interpolate(cam_128.unsqueeze(1), size=(16, 16)).squeeze(1)
-                mask_b = F.interpolate(cam_128.unsqueeze(1), size=(32, 32)).squeeze(1)
+                mask_t = F.interpolate(cam_128.unsqueeze(1), size=(8, 8), mode='bilinear', align_corners=False).squeeze(1)
+                mask_m = F.interpolate(cam_128.unsqueeze(1), size=(16, 16), mode='bilinear', align_corners=False).squeeze(1)
+                mask_b = F.interpolate(cam_128.unsqueeze(1), size=(32, 32), mode='bilinear', align_corners=False).squeeze(1)
                 masks = [mask_t, mask_m, mask_b]
 
-                x_cf, _ = self.model(img, ig_map, masks, target_labels, probs, attr_idx, hard=True)
+                overlay_mask = F.interpolate(
+                    mask_b.unsqueeze(1),
+                    size=img.shape[2:],
+                    mode='bilinear',
+                    align_corners=False
+                ).squeeze(1).clamp(0, 1)
+
+                x_cf, _, _ = self.model(
+                    img,
+                    ig_map,
+                    masks,
+                    target_labels,
+                    probs,
+                    attr_idx,
+                    hard=True
+                )
 
             results['cfs'].append({
                 'image': x_cf.cpu(),
                 'attr_idx': attr_idx,
                 'attr_name': self.attr_names[attr_idx],
-                'cam_mask': cam_128.cpu()
+                'ig_map': ig_map.cpu(),
+                'cam_overlay': overlay_mask.cpu()
             })
 
         return results
@@ -556,38 +697,28 @@ class ComprehensiveTrainer:
         print(f"📊 Logging to: {self.log_dir}")
         print(f"💾 Checkpoints to: {self.checkpoint_dir}")
         print(f"🎨 Visualizations to: {self.vis_dir}")
-        
+
         for epoch in range(num_epochs):
             epoch_losses = self.train_epoch(epoch, loader_train)
-            
-            # ✅ SAVE CHECKPOINT EVERY EPOCH
+
             is_best = epoch_losses['total'] < self.best_loss
             if is_best:
                 self.best_loss = epoch_losses['total']
             self.save_checkpoint(epoch, is_best=is_best)
-            
+
             if loader_val:
                 self.validate_and_visualize(epoch, loader_val, num_samples=4)
+
             if epoch % 5 == 0:
                 self.plot_inference(loader_val or loader_train, epoch, num_samples=4)
+
             if hasattr(self.cfg, 'lr_schedule'):
-                self._update_learning_rate(epoch)
-        
-        print("\n✅ Training complete!")
-        print(f"📁 Results saved to: {self.exp_dir}")
-        
-        self.writer.close()
-        self.csv_file.close()
-    
-    def _update_learning_rate(self, epoch):
-        """Update learning rate based on schedule"""
-        if hasattr(self.cfg, 'lr_schedule'):
-            schedule = self.cfg.lr_schedule
-            if epoch in schedule:
-                new_lr = schedule[epoch]
-                for param_group in self.optimizer.param_groups:
-                    param_group['lr'] = new_lr
-                print(f"📉 Learning rate updated to {new_lr}")
+                schedule = self.cfg.lr_schedule
+                if epoch in schedule:
+                    new_lr = schedule[epoch]
+                    for param_group in self.optimizer.param_groups:
+                        param_group['lr'] = new_lr
+                    print(f"📉 Learning rate updated to {new_lr}")
 
 
 def main():

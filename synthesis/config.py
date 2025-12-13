@@ -1,6 +1,7 @@
 import argparse
 from pathlib import Path
 from ..unsupervised_latentspace.config import Config as VQVAEConfig
+from .dataset import SELECTED_ATTRIBUTES
 
 
 class Config(VQVAEConfig):
@@ -34,8 +35,9 @@ class Config(VQVAEConfig):
         # ============================================================================
         # Classifier Configuration
         # ============================================================================
-        self.num_attributes = 40
-        self.num_classes = 40
+        self.num_attributes = len(SELECTED_ATTRIBUTES)
+        self.num_classes = len(SELECTED_ATTRIBUTES)
+        self.active_attributes = list(SELECTED_ATTRIBUTES)
         
         # ============================================================================
         # Synthesis-Specific Data Config
@@ -81,11 +83,12 @@ class Config(VQVAEConfig):
         # ============================================================================
         # Decoder Sharpening Settings
         # ============================================================================   
-        self.sharpening_epochs = 20
+        self.sharpening_epochs = 15
         self.g_sharpening_lr = 2e-4
         self.d_sharpening_lr = 1e-5
         self.sharpening_betas = (0.0, 0.99)
         self.sharpening_checkpoint_dir = "outputs/synth_network/stylegan_decoder_sharpened"
+        self.sharpened_decoder_path = ""
         
         
     @classmethod
@@ -95,8 +98,8 @@ class Config(VQVAEConfig):
         parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
         parser.add_argument('--batch_size', type=int, default=4, help='Batch size')
         parser.add_argument('--num_epochs', type=int, default=50, help='Number of epochs')
-        parser.add_argument('--vqvae_path', type=str, default='outputs/checkpoints_production/best_model.pth')
-        parser.add_argument('--classifier_path', type=str, default='outputs/trained_classifiers(0512)/best_model.pth')
+        parser.add_argument('--vqvae_path', type=str, default='outputs/checkpoints_production/checkpoint_step_22500.pth')
+        parser.add_argument('--classifier_path', type=str, default='outputs/cnn_classifier/best_model.pth')
         parser.add_argument('--data_root', type=str, default='Dataset/celeba_70percent_721/train')
         
         args = parser.parse_args()

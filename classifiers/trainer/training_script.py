@@ -1,295 +1,280 @@
 import argparse
+import json
 import os
+from typing import Dict, Optional, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from sklearn.model_selection import train_test_split
+from torch.optim.lr_scheduler import _LRScheduler
 from torch.utils.data import DataLoader
 from torchvision import transforms
-import matplotlib.pyplot as plt
-import seaborn as sns
-import pandas as pd
-import json
-from src.classifiers.ex_classifier import CelebAClassifierDataset, ExplainableClassifier
-from src.classifiers.cam_utils import get_gradcam_mask
-from src.classifiers.ig_utils import get_ig_safe
+from tqdm import tqdm
 
-def auto_detect_celeba_paths(dataset_dir):
-    # Detect train/val/test image dirs and their respective attribute files
-    train_img = val_img = test_img = None
-    train_attr = val_attr = test_attr = None
+from ..attributes import SELECTED_ATTRIBUTES
+from ..dataset import CelebADataset
+from ..model import ResNet50_CBAM, SquarePadResize
 
-    for root, dirs, files in os.walk(dataset_dir):
-        for d in dirs:
-            if d == "img_align_celeba":
-                if "train" in root:
-                    train_img = os.path.join(root, d)
-                elif "val" in root:
-                    val_img = os.path.join(root, d)
-                elif "test" in root:
-                    test_img = os.path.join(root, d)
-        for f in files:
-            if f.startswith("list_attr_celeba") and (f.endswith(".txt") or f.endswith(".csv")):
-                if "train" in root:
-                    train_attr = os.path.join(root, f)
-                elif "val" in root:
-                    val_attr = os.path.join(root, f)
-                elif "test" in root:
-                    test_attr = os.path.join(root, f)
-    # Fallback: attribute files may be in dataset_dir root
-    if train_attr is None or val_attr is None or test_attr is None:
-        for f in os.listdir(dataset_dir):
-            if f.startswith("list_attr_celeba") and (f.endswith(".txt") or f.endswith(".csv")):
-                if "train" in f and train_attr is None:
-                    train_attr = os.path.join(dataset_dir, f)
-                elif "val" in f and val_attr is None:
-                    val_attr = os.path.join(dataset_dir, f)
-                elif "test" in f and test_attr is None:
-                    test_attr = os.path.join(dataset_dir, f)
-    return train_img, val_img, test_img, train_attr, val_attr, test_attr
 
-def calculate_metrics(y_true, y_pred, attribute_names):
-    # Multi-label metrics (standalone, no sklearn)
-    y_true = y_true.cpu().numpy()
-    y_pred = y_pred.cpu().numpy()
-    exact_match = (y_true == y_pred).all(axis=1).mean()
-    hamming = (y_true != y_pred).mean()
-    per_attr_acc = (y_true == y_pred).mean(axis=0)
-    metrics = {
-        'exact_match_ratio': float(exact_match),
-        'hamming_loss': float(hamming),
-        'per_attribute_accuracy': {attr: float(per_attr_acc[i]) for i, attr in enumerate(attribute_names)}
-    }
-    return metrics
+def build_dataloaders(
+    csv_path: str,
+    image_dir: str,
+    batch_size: int,
+    image_size: int,
+    num_workers: int,
+    val_split: float,
+    seed: int,
+) -> Tuple[DataLoader, DataLoader, torch.Tensor, Sequence[str], pd.DataFrame, pd.DataFrame]:
+    """Create train/validation dataloaders and class weights."""
 
-def plot_training_curves(history, save_dir):
-    epochs = [h['epoch'] for h in history]
-    train_loss = [h['train_loss'] for h in history]
-    val_loss = [h['val_loss'] for h in history]
-    val_acc = [h['val_acc'] for h in history]
+    df_attr = pd.read_csv(csv_path, index_col=0)
+    missing = [attr for attr in SELECTED_ATTRIBUTES if attr not in df_attr.columns]
+    if missing:
+        raise ValueError(f"Missing required CelebA attributes: {missing}")
 
-    plt.figure(figsize=(10,4))
-    plt.subplot(1,2,1)
-    plt.plot(epochs, train_loss, label='Train Loss')
-    plt.plot(epochs, val_loss, label='Val Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title('Loss Curves')
-    plt.legend()
+    df_attr = df_attr.loc[:, SELECTED_ATTRIBUTES]
+    train_df, val_df = train_test_split(df_attr, test_size=val_split, random_state=seed)
 
-    plt.subplot(1,2,2)
-    plt.plot(epochs, val_acc, label='Val Accuracy')
-    plt.xlabel('Epoch')
-    plt.ylabel('Accuracy')
-    plt.title('Validation Accuracy')
-    plt.legend()
+    train_labels = train_df.replace(-1, 0).values
+    num_pos = np.sum(train_labels, axis=0)
+    num_neg = len(train_df) - num_pos
+    pos_weights = torch.tensor(num_neg / (num_pos + 1e-5), dtype=torch.float32)
 
-    plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, "training_curves.png"))
-    plt.close()
-
-def plot_per_attribute_heatmap(per_attr_acc, attribute_names, save_dir):
-    plt.figure(figsize=(12,6))
-    sns.heatmap([list(per_attr_acc.values())], annot=True, fmt=".2f", cmap="YlGnBu", xticklabels=attribute_names)
-    plt.title("Per-Attribute Accuracy (Final Epoch)")
-    plt.yticks([])
-    plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, "per_attribute_accuracy_heatmap.png"))
-    plt.close()
-
-def generate_markdown_report(history, metrics, save_dir, model_name):
-    report = f"""# Training Report: {model_name}
-
-**Best Validation Accuracy:** {max([h['val_acc'] for h in history]):.4f}
-
-## Training Curves
-
-![Training Curves](training_curves.png)
-
-## Per-Attribute Accuracy (Final Epoch)
-
-![Per-Attribute Accuracy](per_attribute_accuracy_heatmap.png)
-
-## Final Metrics
-
-- Exact Match Ratio: {metrics['exact_match_ratio']:.4f}
-- Hamming Loss: {metrics['hamming_loss']:.4f}
-
-### Per-Attribute Accuracy
-
-| Attribute | Accuracy |
-|-----------|----------|
-"""
-    for attr, acc in metrics['per_attribute_accuracy'].items():
-        report += f"| {attr} | {acc:.4f} |\n"
-
-    with open(os.path.join(save_dir, "README.md"), "w") as f:
-        f.write(report)
-
-def train_and_report_all_models(args, attribute_names):
-    # If dataset_dir is provided, auto-detect paths
-    if hasattr(args, "dataset_dir") and args.dataset_dir:
-        train_img, val_img, test_img, train_attr, val_attr, test_attr = auto_detect_celeba_paths(args.dataset_dir)
-        args.train_dir = train_img
-        args.val_dir = val_img
-        args.train_attr_file = train_attr
-        args.val_attr_file = val_attr
-        print(f"Auto-detected paths:\n  train_dir: {args.train_dir}\n  val_dir: {args.val_dir}\n  train_attr_file: {args.train_attr_file}\n  val_attr_file: {args.val_attr_file}")
-
-    model_variants = ['mobilenet_v2', 'mobilenet_v3_small', 'resnet18', 'resnet34']
-    all_histories = {}
-    all_metrics = {}
-
-    transform = transforms.Compose([
-        transforms.Resize(128),
-        transforms.CenterCrop(128),
+    train_transform = transforms.Compose([
+        SquarePadResize(image_size),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        transforms.RandomErasing(p=0.5, scale=(0.02, 0.2), ratio=(0.3, 3.3), value=0),
     ])
-    train_set = CelebAClassifierDataset(args.train_dir, args.train_attr_file, transform, attribute_names)
-    val_set = CelebAClassifierDataset(args.val_dir, args.val_attr_file, transform, attribute_names)
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=4)
 
-    for model_name in model_variants:
-        print(f"\n=== Training {model_name} ===")
-        model_save_dir = os.path.join(args.save_dir, model_name)
-        os.makedirs(model_save_dir, exist_ok=True)
-        model = ExplainableClassifier(model_name, len(attribute_names), attribute_names).to(args.device)
-        criterion = nn.BCEWithLogitsLoss()
-        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3, factor=0.5)
-        best_acc = 0.0
-        history = []
+    val_transform = transforms.Compose([
+        SquarePadResize(image_size),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
 
-        for epoch in range(args.epochs):
-            model.train()
-            train_loss = 0.0
-            for img, label in train_loader:
-                img, label = img.to(args.device), label.to(args.device)
-                optimizer.zero_grad()
-                logits = model(img)
-                loss = criterion(logits, label)
-                loss.backward()
-                optimizer.step()
-                train_loss += loss.item()
-            train_loss /= len(train_loader)
+    train_dataset = CelebADataset(train_df, image_dir, transform=train_transform)
+    val_dataset = CelebADataset(val_df, image_dir, transform=val_transform)
 
-            model.eval()
-            val_preds, val_trues = [], []
-            val_loss = 0.0
-            with torch.no_grad():
-                for img, label in val_loader:
-                    img, label = img.to(args.device), label.to(args.device)
-                    logits = model(img)
-                    loss = criterion(logits, label)
-                    val_loss += loss.item()
-                    preds = (torch.sigmoid(logits) > 0.5).float()
-                    val_preds.append(preds.cpu())
-                    val_trues.append(label.cpu())
-            val_preds = torch.cat(val_preds)
-            val_trues = torch.cat(val_trues)
-            acc = (val_preds == val_trues).float().mean().item()
-            val_loss /= len(val_loader)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+        prefetch_factor=4 if num_workers > 0 else None,
+    )
 
-            metrics = calculate_metrics(val_trues, val_preds, attribute_names)
-            history.append({
-                'epoch': epoch+1,
-                'train_loss': train_loss,
-                'val_loss': val_loss,
-                'val_acc': acc,
-                'exact_match_ratio': metrics['exact_match_ratio'],
-                'hamming_loss': metrics['hamming_loss'],
-                'per_attribute_accuracy': metrics['per_attribute_accuracy']
-            })
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        prefetch_factor=4 if num_workers > 0 else None,
+    )
 
-            # Only print concise summary per epoch (no duplication)
-            print(f"Epoch {epoch+1}/{args.epochs} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Acc: {acc:.4f}")
+    return train_loader, val_loader, pos_weights, SELECTED_ATTRIBUTES, train_df, val_df
 
-            if acc > best_acc:
-                best_acc = acc
-                torch.save(model.state_dict(), os.path.join(model_save_dir, "best_model.pth"))
 
-            scheduler.step(val_loss)
+def create_model(num_classes: int, device: torch.device) -> nn.Module:
+    """Initialise the ResNet50 + CBAM model."""
 
-        # Save history and metrics
-        pd.DataFrame(history).to_csv(os.path.join(model_save_dir, "training_history.csv"), index=False)
-        with open(os.path.join(model_save_dir, "training_history.json"), "w") as f:
-            json.dump(history, f, indent=2)
-        all_histories[model_name] = history
-        all_metrics[model_name] = history[-1]
+    model = ResNet50_CBAM(num_classes=num_classes)
+    return model.to(device)
 
-        # Visualizations for each model
-        plot_training_curves(history, model_save_dir)
-        plot_per_attribute_heatmap(history[-1]['per_attribute_accuracy'], attribute_names, model_save_dir)
-        generate_markdown_report(history, metrics, model_save_dir, model_name)
 
-    # --- Comparison Plots ---
-    plt.figure(figsize=(8,5))
-    for model_name in model_variants:
-        val_acc = [h['val_acc'] for h in all_histories[model_name]]
-        plt.plot(range(1, len(val_acc)+1), val_acc, label=model_name)
-    plt.xlabel('Epoch')
-    plt.ylabel('Validation Accuracy')
-    plt.title('Validation Accuracy Comparison')
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(os.path.join(args.save_dir, "val_accuracy_comparison.png"))
-    plt.close()
+def train_resnet50_cbam(
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    criterion: nn.Module,
+    optimizer: optim.Optimizer,
+    scheduler: Optional[_LRScheduler],
+    device: torch.device,
+    num_epochs: int,
+    attribute_names: Sequence[str],
+    checkpoint_dir: str,
+    checkpoint_prefix: str = "resnet50_cbam",
+    save_every: int = 5,
+    threshold: float = 0.5,
+) -> Dict[str, Sequence[float]]:
+    """Train ResNet50+CBAM with validation tracking and checkpointing."""
 
-    acc_matrix = []
-    for model_name in model_variants:
-        accs = list(all_metrics[model_name]['per_attribute_accuracy'].values())
-        acc_matrix.append(accs)
-    cell_width = 6
-    cell_height = 6
-    fig_width = cell_width * len(attribute_names)
-    fig_height = cell_height * len(model_variants)
-    plt.figure(figsize=(fig_width, fig_height))
-    sns.heatmap(acc_matrix, annot=True, fmt=".2f", cmap="YlGnBu", xticklabels=attribute_names, yticklabels=model_variants)
-    plt.title("Per-Attribute Accuracy (Final Epoch) Across Models")
-    plt.tight_layout()
-    plt.savefig(os.path.join(args.save_dir, "per_attribute_accuracy_comparison.png"))
-    plt.close()
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    history = {"train_loss": [], "val_loss": [], "val_attr_acc": []}
+    best_val_loss = float("inf")
 
-    # --- Markdown Report ---
-    report = "# Model Comparison Report\n\n"
-    report += "## Validation Accuracy Comparison\n\n"
-    report += "![Validation Accuracy Comparison](val_accuracy_comparison.png)\n\n"
-    report += "## Per-Attribute Accuracy Comparison\n\n"
-    report += "![Per-Attribute Accuracy Comparison](per_attribute_accuracy_comparison.png)\n\n"
-    report += "## Final Metrics Table\n\n"
-    report += "| Model | Exact Match | Hamming Loss | Best Val Acc |\n|-------|-------------|--------------|--------------|\n"
-    for model_name in model_variants:
-        m = all_metrics[model_name]
-        report += f"| {model_name} | {m['exact_match_ratio']:.4f} | {m['hamming_loss']:.4f} | {m['val_acc']:.4f} |\n"
-    with open(os.path.join(args.save_dir, "README.md"), "w") as f:
-        f.write(report)
-    print(f"\nAll model results, plots, and markdown report saved to {args.save_dir}")
+    for epoch in range(1, num_epochs + 1):
+        model.train()
+        running_loss = 0.0
+        train_iter = tqdm(train_loader, desc=f"Epoch {epoch}/{num_epochs} [Train]")
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--dataset_dir', type=str, default=None, help='Root CelebA dataset directory')
-    parser.add_argument('--train_dir', type=str, default=None)
-    parser.add_argument('--val_dir', type=str, default=None)
-    parser.add_argument('--attr_file', type=str, default=None)
-    parser.add_argument('--epochs', type=int, default=30)
-    parser.add_argument('--batch_size', type=int, default=64)
-    parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--save_dir', type=str, default='trained_classifiers')
-    args = parser.parse_args()
-    args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    attribute_names = [
-        "5_o_Clock_Shadow", "Arched_Eyebrows", "Attractive", "Bags_Under_Eyes", "Bald",
-        "Bangs", "Big_Lips", "Big_Nose", "Black_Hair", "Blond_Hair", "Brown_Hair",
-        "Bushy_Eyebrows", "Chubby", "Double_Chin", "Eyeglasses", "Goatee", "Gray_Hair",
-        "Heavy_Makeup", "High_Cheekbones", "Male", "Mouth_Slightly_Open", "Mustache",
-        "Narrow_Eyes", "No_Beard", "Oval_Face", "Pale_Skin", "Pointy_Nose",
-        "Receding_Hairline", "Rosy_Cheeks", "Sideburns", "Smiling", "Straight_Hair",
-        "Wavy_Hair", "Wearing_Earrings", "Wearing_Hat", "Wearing_Lipstick",
-        "Wearing_Necklace", "Wearing_Necktie", "Young"
-    ]
-    train_and_report_all_models(args, attribute_names)
+        for images, labels in train_iter:
+            images = images.to(device)
+            labels = labels.to(device)
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item() * images.size(0)
+            train_iter.set_postfix(loss=loss.item())
+
+        epoch_train_loss = running_loss / len(train_loader.dataset)
+        history["train_loss"].append(epoch_train_loss)
+
+        current_lr = None
+        if scheduler is not None:
+            scheduler.step()
+            if hasattr(scheduler, "get_last_lr"):
+                current_lr = scheduler.get_last_lr()[0]
+
+        model.eval()
+        val_running_loss = 0.0
+        all_preds = []
+        all_targets = []
+        val_iter = tqdm(val_loader, desc=f"Epoch {epoch}/{num_epochs} [Val]")
+
+        with torch.no_grad():
+            for images, labels in val_iter:
+                images = images.to(device)
+                labels = labels.to(device)
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+                val_running_loss += loss.item() * images.size(0)
+                probs = torch.sigmoid(outputs)
+                all_preds.append(probs.cpu().numpy())
+                all_targets.append(labels.cpu().numpy())
+
+        epoch_val_loss = val_running_loss / len(val_loader.dataset)
+        history["val_loss"].append(epoch_val_loss)
+
+        all_preds = np.concatenate(all_preds, axis=0)
+        all_targets = np.concatenate(all_targets, axis=0)
+        binary_preds = (all_preds > threshold).astype(int)
+        correct_counts = np.sum(binary_preds == all_targets, axis=0)
+        acc_per_attr = correct_counts / len(val_loader.dataset)
+        history["val_attr_acc"].append(acc_per_attr.tolist())
+        mean_acc = float(np.mean(acc_per_attr))
+
+        header = "-" * 60
+        print(f"\n--- Epoch {epoch} Report ---")
+        if current_lr is not None:
+            print(
+                f"LR: {current_lr:.6f} | Train Loss: {epoch_train_loss:.4f} | "
+                f"Val Loss: {epoch_val_loss:.4f} | Mean Val Acc: {mean_acc:.4f}"
+            )
+        else:
+            print(
+                f"Train Loss: {epoch_train_loss:.4f} | Val Loss: {epoch_val_loss:.4f} "
+                f"| Mean Val Acc: {mean_acc:.4f}"
+            )
+        print(header)
+        print(f"{'Attribute':<25} | {'Accuracy':<10} | {'Sample Prob (Mean)':<15}")
+        print(header)
+        mean_probs = np.mean(all_preds, axis=0)
+        for idx, attr_name in enumerate(attribute_names):
+            print(f"{attr_name:<25} | {acc_per_attr[idx]:.4f}     | {mean_probs[idx]:.4f}")
+        print(header)
+
+        if save_every and epoch % save_every == 0:
+            ckpt_name = f"{checkpoint_prefix}_epoch_{epoch}.pth"
+            save_path = os.path.join(checkpoint_dir, ckpt_name)
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "loss": epoch_val_loss,
+                },
+                save_path,
+            )
+            print(f"Saved checkpoint: {save_path}")
+
+        if epoch_val_loss < best_val_loss:
+            best_val_loss = epoch_val_loss
+            torch.save(model.state_dict(), os.path.join(checkpoint_dir, "best_model.pth"))
+
+    print("Training Complete.")
+    return history
+
+
+def save_history(history: Dict[str, Sequence[float]], output_dir: str) -> None:
+    """Persist training history to disk."""
+
+    os.makedirs(output_dir, exist_ok=True)
+    with open(os.path.join(output_dir, "history.json"), "w") as f:
+        json.dump(history, f, indent=2)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train ResNet50 + CBAM on CelebA attributes")
+    parser.add_argument("csv", help="Path to CelebA attribute CSV containing selected attributes")
+    parser.add_argument("images", help="Directory with CelebA images")
+    parser.add_argument("--output", default="outputs/cnn_classifier", help="Directory to store checkpoints")
+    parser.add_argument("--batch-size", type=int, default=48)
+    parser.add_argument("--image-size", type=int, default=224)
+    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--val-split", type=float, default=0.1)
+    parser.add_argument("--num-workers", type=int, default=8)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    if args.device == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(args.device)
+
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+
+    train_loader, val_loader, pos_weights, attribute_names, train_df, val_df = build_dataloaders(
+        csv_path=args.csv,
+        image_dir=args.images,
+        batch_size=args.batch_size,
+        image_size=args.image_size,
+        num_workers=args.num_workers,
+        val_split=args.val_split,
+        seed=args.seed,
+    )
+
+    model = create_model(num_classes=len(attribute_names), device=device)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weights.to(device))
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=7, gamma=0.1)
+
+    history = train_resnet50_cbam(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        criterion=criterion,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        device=device,
+        num_epochs=args.epochs,
+        attribute_names=attribute_names,
+        checkpoint_dir=args.output,
+        checkpoint_prefix="resnet50_cbam",
+        save_every=5,
+        threshold=0.5,
+    )
+
+    save_history(history, args.output)
+    train_df.to_csv(os.path.join(args.output, "train_split.csv"))
+    val_df.to_csv(os.path.join(args.output, "val_split.csv"))
+
 
 if __name__ == "__main__":
     main()

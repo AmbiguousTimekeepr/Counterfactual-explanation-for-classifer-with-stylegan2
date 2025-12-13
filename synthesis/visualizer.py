@@ -71,7 +71,7 @@ class CounterfactualVisualizer:
         
         return overlaid
     
-    def create_comparison_grid(self, img_orig, cf_results, labels, attr_names):
+    def create_comparison_grid(self, img_orig, cf_results, labels, attr_names, active_indices=None, active_names=None):
         """
         Create comprehensive comparison grid:
         Row 1: Original | CAM Overlay | (empty space)
@@ -79,15 +79,15 @@ class CounterfactualVisualizer:
         
         Args:
             img_orig: [1, 3, H, W] original image
-            cf_results: dict with 'original', 'cfs' (list of dicts with 'image', 'attr_name', 'cam_mask')
-            labels: [1, 40] binary labels
+            cf_results: dict with 'original', 'cfs' (list of dicts with 'image', 'attr_name', 'ig_map', 'cam_overlay')
+            labels: [1, num_attributes] binary labels
             attr_names: list of attribute names
         
         Returns:
             matplotlib figure
         """
-        fig = plt.figure(figsize=(15, 8))
-        gs = GridSpec(2, 3, figure=fig, hspace=0.35, wspace=0.25)
+        fig = plt.figure(figsize=(17, 8))
+        gs = GridSpec(2, 4, figure=fig, width_ratios=[1, 1, 1, 1.3], hspace=0.35, wspace=0.25)
         
         img_orig_np = self.tensor_to_image(img_orig)
         
@@ -101,46 +101,76 @@ class CounterfactualVisualizer:
         # CAM overlay
         ax1 = fig.add_subplot(gs[0, 1])
         if cf_results['cfs']:
-            cam_first = cf_results['cfs'][0]['cam_mask']
-            overlaid = self.apply_cam_overlay(img_orig, cam_first, alpha=0.5)
-            ax1.imshow(overlaid)
-        ax1.set_title('Edit Region (CAM Overlay)', fontsize=12, fontweight='bold')
+            ig_first = cf_results['cfs'][0]['ig_map']
+            overlaid_ig = self.apply_cam_overlay(img_orig, ig_first, alpha=0.5)
+            ax1.imshow(overlaid_ig)
+        ax1.set_title('IG Overlay (Integrated Gradients)', fontsize=12, fontweight='bold')
         ax1.axis('off')
-        
-        # Attribute info
+
         ax2 = fig.add_subplot(gs[0, 2])
+        if cf_results['cfs']:
+            cam_first = cf_results['cfs'][0]['cam_overlay']
+            overlaid_cam = self.apply_cam_overlay(img_orig, cam_first, alpha=0.5)
+            ax2.imshow(overlaid_cam)
+        ax2.set_title('CAM Mask Overlay', fontsize=12, fontweight='bold')
         ax2.axis('off')
+
+        # Attribute info
+        ax3 = fig.add_subplot(gs[0, 3])
+        ax3.axis('off')
         
-        # Get current predictions
-        attr_text = "Current Attributes:\n" + "-" * 30 + "\n"
+        # Determine active attribute subset for display
+        if active_indices is None:
+            active_indices = list(range(len(attr_names)))
+        if active_names is None:
+            active_names = [attr_names[idx] for idx in active_indices]
+
         label_np = labels[0].cpu().numpy().astype(int)
-        for i in range(min(10, len(attr_names))):  # Show first 10
-            attr_text += f"{attr_names[i]}: {label_np[i]}\n"
-        attr_text += "...\n(showing first 10)"
+
+        attr_text = "Active Attributes:\n" + "-" * 30 + "\n"
+        display_count = min(10, len(active_indices))
+        for idx, name in zip(active_indices[:display_count], active_names[:display_count]):
+            val = label_np[idx] if idx < label_np.shape[0] else 0
+            attr_text += f"{name}: {val}\n"
+        if len(active_indices) > display_count:
+            attr_text += "...\n(showing first 10)"
         
-        ax2.text(0.1, 0.9, attr_text, transform=ax2.transAxes,
+        ax3.text(0.1, 0.9, attr_text, transform=ax3.transAxes,
                 fontsize=9, verticalalignment='top', family='monospace',
                 bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
         
         # Row 2: Counterfactuals
         # ========================
         for cf_idx, cf_data in enumerate(cf_results['cfs'][:3]):  # Show first 3
+            if cf_idx >= 3:
+                break
             ax = fig.add_subplot(gs[1, cf_idx])
-            
+
+            ig_overlay = self.apply_cam_overlay(img_orig, cf_data['ig_map'], alpha=0.5)
+            cam_overlay = self.apply_cam_overlay(img_orig, cf_data['cam_overlay'], alpha=0.5)
             cf_img = self.tensor_to_image(cf_data['image'])
-            ax.imshow(cf_img)
-            
+            panel = np.concatenate([ig_overlay, cam_overlay, cf_img], axis=1)
+            ax.imshow(panel)
+
             attr_name = cf_data['attr_name']
             attr_idx = cf_data['attr_idx']
             current_val = label_np[attr_idx]
             new_val = 1 - current_val
             
             title = f"CF{cf_idx+1}: {attr_name}\n"
-            title += f"({current_val} → {new_val})"
+            title += f"({current_val} → {new_val}) | IG → CAM → Edit"
             
             ax.set_title(title, fontsize=11, fontweight='bold', color='darkblue')
             ax.axis('off')
         
+        if len(cf_results['cfs']) < 3:
+            for empty_idx in range(len(cf_results['cfs']), 3):
+                ax_empty = fig.add_subplot(gs[1, empty_idx])
+                ax_empty.axis('off')
+
+        ax_unused = fig.add_subplot(gs[1, 3])
+        ax_unused.axis('off')
+
         # Add overall title
         fig.suptitle('Counterfactual Generation Results', fontsize=14, fontweight='bold', y=0.98)
         

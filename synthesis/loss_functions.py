@@ -26,6 +26,14 @@ class CounterfactualLossManager(nn.Module):
         self.mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
         self.std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
 
+        self.base_weights = {
+            'cf': 10.0,
+            'retention': 5.0,
+            'latent_prox': 5.0,
+            'ortho': 0.3,
+            'sparse': 1e-3
+        }
+
     # ===============================================================
     # 1. Counterfactual Classification Loss (Margin-based)
     # ===============================================================
@@ -155,15 +163,7 @@ class CounterfactualLossManager(nn.Module):
                        directions,
                        weights=None):
         if weights is None:
-            w = {
-                'cf': 10.0,
-                'retention': 15.0,
-                'latent_prox': 5.0,
-                'ortho': 0.3,
-                'sparse': 1e-3
-            }
-        else:
-            w = weights
+            weights = self.base_weights
 
         losses = {}
 
@@ -173,11 +173,11 @@ class CounterfactualLossManager(nn.Module):
         losses['ortho'] = self.orthogonality_loss(directions)
         losses['sparse'] = self.direction_sparsity(directions)
 
-        total = (w['cf'] * losses['cf'] +
-                 w['retention'] * losses['retention'] +
-                 w['latent_prox'] * losses['latent_prox'] +
-                 w['ortho'] * losses['ortho'] +
-                 w['sparse'] * losses['sparse'])
+        total = (weights['cf'] * losses['cf'] +
+                 weights['retention'] * losses['retention'] +
+                 weights['latent_prox'] * losses['latent_prox'] +
+                 weights['ortho'] * losses['ortho'] +
+                 weights['sparse'] * losses['sparse'])
 
         losses['total'] = total
         return losses

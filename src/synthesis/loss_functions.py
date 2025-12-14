@@ -27,12 +27,13 @@ class CounterfactualLossManager(nn.Module):
         self.std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
 
         self.base_weights = {
-            'cf': 10.0,
-            'retention': 5.0,
-            'latent_prox': 5.0,
+            'cf': 8.0,
+            'retention': 12.0,
+            'latent_prox': 4.0,
             'ortho': 0.3,
             'sparse': 1e-3
         }
+        self.latent_level_weights = [1.4, 1.0, 0.6]
 
     # ===============================================================
     # 1. Counterfactual Classification Loss (Margin-based)
@@ -118,8 +119,9 @@ class CounterfactualLossManager(nn.Module):
     # 3. Latent Proximity (Minimal Code Change)
     # ===============================================================
     def latent_proximity_loss(self, z_orig_list, z_edited_list, cam_masks):
-        loss = 0.0
-        for z_orig, z_edited, mask in zip(z_orig_list, z_edited_list, cam_masks):
+        total = 0.0
+        weight_sum = 0.0
+        for level_idx, (z_orig, z_edited, mask) in enumerate(zip(z_orig_list, z_edited_list, cam_masks)):
             # ✅ DETACH z_orig since encoder is frozen
             z_orig = z_orig.detach()
             # ✅ DETACH mask (no gradient needed)
@@ -135,9 +137,17 @@ class CounterfactualLossManager(nn.Module):
             preserve_region = ~edit_region
 
             # Only penalize changes in preserved regions
-            diff = (z_orig - z_edited).abs()
-            loss += (diff * preserve_region.float()).mean() * 10.0
-        return loss / len(z_orig_list)
+            mask_float = preserve_region.float()
+            diff_sq = (z_orig - z_edited).pow(2)
+
+            denom = mask_float.sum(dim=[1, 2, 3]).clamp_min(1e-6)
+            per_level = ((diff_sq * mask_float).sum(dim=[1, 2, 3]) / denom).mean()
+
+            level_weight = self.latent_level_weights[level_idx] if level_idx < len(self.latent_level_weights) else 1.0
+            total += level_weight * per_level * 10.0
+            weight_sum += level_weight
+
+        return total / max(weight_sum, 1e-6)
 
     # ===============================================================
     # 4. Orthogonality + Direction Sparsity
@@ -173,11 +183,15 @@ class CounterfactualLossManager(nn.Module):
         losses['ortho'] = self.orthogonality_loss(directions)
         losses['sparse'] = self.direction_sparsity(directions)
 
+        perc_consistency = self.lpips(x_new, x_orig).mean() * 2.0
+        losses['perc_consistency'] = perc_consistency
+
         total = (weights['cf'] * losses['cf'] +
-                 weights['retention'] * losses['retention'] +
-                 weights['latent_prox'] * losses['latent_prox'] +
-                 weights['ortho'] * losses['ortho'] +
-                 weights['sparse'] * losses['sparse'])
+             weights['retention'] * losses['retention'] +
+             weights['latent_prox'] * losses['latent_prox'] +
+             weights['ortho'] * losses['ortho'] +
+             weights['sparse'] * losses['sparse'] +
+             perc_consistency)
 
         losses['total'] = total
         return losses

@@ -19,6 +19,7 @@ from .generator import CounterfactualGenerator
 from .loss_functions import CounterfactualLossManager
 from .dataset import CelebADataset, get_loader, get_attribute_names
 from .visualizer import CounterfactualVisualizer
+from .discriminator_manager import PatchGANDiscriminator
 
 
 class ComprehensiveTrainer:
@@ -84,13 +85,26 @@ class ComprehensiveTrainer:
         
         self.loss_manager = CounterfactualLossManager(device=self.device)
         
-        # Optimizer: only Mutator
+        for p in self.model.decoder.parameters():
+            p.requires_grad = True
+
         self.optimizer = optim.AdamW(
-            self.model.mutator.parameters(),
-            lr=self.cfg.learning_rate,
+            [
+                {'params': self.model.mutator.parameters(), 'lr': self.cfg.learning_rate},
+                {'params': self.model.decoder.parameters(), 'lr': self.cfg.learning_rate * 0.1}
+            ],
             weight_decay=self.cfg.weight_decay
         )
-        
+
+        self.discriminator = PatchGANDiscriminator().to(self.device)
+        self.discriminator.train()
+        self.opt_d = optim.AdamW(
+            self.discriminator.parameters(),
+            lr=self.cfg.learning_rate * 0.5,
+            betas=(0.5, 0.999)
+        )
+        self.adv_weight = getattr(self.cfg, 'adv_weight', 1.0)
+
         self.scaler = GradScaler()
         self.decoder_pretrained = False
 
@@ -137,7 +151,7 @@ class ComprehensiveTrainer:
         fieldnames = [
             'epoch', 'batch', 'step', 'total_loss',
             'cf_loss', 'retention_loss', 'latent_prox_loss',
-            'ortho_loss', 'sparse_loss', 'lr',
+            'ortho_loss', 'sparse_loss', 'adv_loss', 'disc_loss', 'lr',
             'embed_orig_top', 'embed_orig_mid', 'embed_orig_bot',
             'embed_cf_top', 'embed_cf_mid', 'embed_cf_bot',
             'step_top', 'step_mid', 'step_bot'
@@ -150,14 +164,21 @@ class ComprehensiveTrainer:
     def _get_attribute_names(self):
         """Get active CelebA attribute names"""
         return get_attribute_names()
+
+    def _set_discriminator_grad(self, requires_grad: bool):
+        """Toggle gradient computation for discriminator parameters."""
+        for param in self.discriminator.parameters():
+            param.requires_grad_(requires_grad)
     
     def train_epoch(self, epoch, loader):
         """Train for one epoch with comprehensive logging"""
         self.model.mutator.train()
+        self.model.decoder.train()
+        self.discriminator.train()
         
         epoch_losses = {
             'total': [], 'cf': [], 'retention': [], 'latent_prox': [],
-            'ortho': [], 'sparse': []
+            'ortho': [], 'sparse': [], 'adv': [], 'disc': []
         }
         attr_losses = {i: [] for i in self.active_attr_indices}
         
@@ -192,22 +213,26 @@ class ComprehensiveTrainer:
             # --- SIGNAL 2: Pseudo-CAM (Shape/Location) ---
             # Used by Loss to decide "Where to allow changes"
             # We must turn the wireframe into a BLOB to allow full-region editing.
-            cam_blob = F.avg_pool2d(
+            smooth_mask = F.avg_pool2d(
                 raw_saliency.unsqueeze(1),
-                kernel_size=11,
+                kernel_size=7,
                 stride=1,
-                padding=5
+                padding=3
             )
+            smooth_mask = F.avg_pool2d(smooth_mask, kernel_size=3, stride=1, padding=1)
 
-            flat = cam_blob.view(cam_blob.size(0), -1)
-            max_val = flat.max(dim=1, keepdim=True)[0].view(-1, 1, 1, 1)
-            mask_norm = cam_blob / (max_val + 1e-8)
-            cam_soft = mask_norm.squeeze(1)
-            cam_blob_final = (cam_soft > 0.05).float()
+            norm = smooth_mask / (smooth_mask.amax(dim=[1, 2, 3], keepdim=True) + 1e-8)
+            norm = norm.pow(2)
+            cam_binary = (norm > 0.45).float()
 
-            mask_t = F.interpolate(cam_blob_final.unsqueeze(1), size=(8, 8)).squeeze(1)
-            mask_m = F.interpolate(cam_blob_final.unsqueeze(1), size=(16, 16)).squeeze(1)
-            mask_b = F.interpolate(cam_blob_final.unsqueeze(1), size=(32, 32)).squeeze(1)
+            kernel = torch.ones(1, 1, 3, 3, device=images.device)
+            eroded = F.conv2d(cam_binary, kernel, padding=1)
+            cam_128 = (eroded == 9).float()
+            cam_soft = cam_128.squeeze(1)
+
+            mask_t = F.interpolate(cam_128, size=(8, 8)).squeeze(1)
+            mask_m = F.interpolate(cam_128, size=(16, 16)).squeeze(1)
+            mask_b = F.interpolate(cam_128, size=(32, 32)).squeeze(1)
             masks = [mask_t, mask_m, mask_b]
 
             probs = torch.sigmoid(logits.detach())
@@ -217,12 +242,45 @@ class ComprehensiveTrainer:
             with torch.no_grad():
                 z_orig_list = self.model.vqvae.get_codes(images)
 
+            use_hard = (epoch >= 5)
+
+            # ====================================================
+            # PHASE 1: Train Discriminator
+            # ====================================================
+            self._set_discriminator_grad(True)
+            self.opt_d.zero_grad()
+
+            with torch.no_grad():
+                x_fake_detached, _, _ = self.model(
+                    images,
+                    ig_map,
+                    masks,
+                    target_labels,
+                    probs,
+                    attr_idx,
+                    hard=use_hard
+                )
+
+            logits_real = self.discriminator(images)
+            d_loss_real = F.relu(1.0 - logits_real).mean()
+
+            logits_fake = self.discriminator(x_fake_detached)
+            d_loss_fake = F.relu(1.0 + logits_fake).mean()
+
+            d_loss = d_loss_real + d_loss_fake
+            d_loss.backward()
+            self.opt_d.step()
+            disc_loss_value = d_loss.detach()
+
+            # ====================================================
+            # PHASE 2: Train Generator (Mutator + Decoder)
+            # ====================================================
+            self._set_discriminator_grad(False)
+
             # ====================================================
             # 2. Forward Pass (Curriculum Learning)
             # ====================================================
             with autocast():
-                use_hard = (epoch >= 5)
-
                 x_new, z_mutated, step_values = self.model(
                     images,
                     ig_map,
@@ -248,6 +306,14 @@ class ComprehensiveTrainer:
                     weights=self._get_dynamic_loss_weights(epoch)
                 )
 
+                logits_fake_for_g = self.discriminator(x_new)
+                g_adv_loss = -logits_fake_for_g.mean()
+                losses['adv'] = g_adv_loss
+
+                base_total = losses['total']
+                losses['total'] = base_total + self.adv_weight * g_adv_loss
+                losses['disc'] = disc_loss_value
+
                 total_loss = losses['total'] / accumulation_steps
             
             # --- Backward pass ---
@@ -272,11 +338,13 @@ class ComprehensiveTrainer:
                 pbar.set_postfix({
                     'loss': f"{losses['total'].item():.4f}",
                     'cf': f"{losses['cf'].item():.3f}",
-                    'ret': f"{losses['retention'].item():.3f}"
+                    'ret': f"{losses['retention'].item():.3f}",
+                    'adv': f"{losses['adv'].item():.3f}",
+                    'd': f"{losses['disc'].item():.3f}"
                 })
             
-            # Memory cleanup
-            del x_new, new_logits, grads, raw_saliency, ig_map, cam_blob, mask_norm, cam_blob_final, cam_soft, losses, step_values, z_mutated, z_orig_list
+            self._set_discriminator_grad(True)
+
             torch.cuda.empty_cache()
         
         # Log epoch summary
@@ -301,6 +369,8 @@ class ComprehensiveTrainer:
         self.writer.add_scalar('Loss/latent_prox', losses['latent_prox'].item(), self.global_step)
         self.writer.add_scalar('Loss/ortho', losses['ortho'].item(), self.global_step)
         self.writer.add_scalar('Loss/sparse', losses['sparse'].item(), self.global_step)
+        self.writer.add_scalar('Loss/adv', losses['adv'].item(), self.global_step)
+        self.writer.add_scalar('Loss/disc', losses['disc'].item(), self.global_step)
         
         row = {
             'epoch': epoch,
@@ -312,6 +382,8 @@ class ComprehensiveTrainer:
             'latent_prox_loss': losses['latent_prox'].item(),
             'ortho_loss': losses['ortho'].item(),
             'sparse_loss': losses['sparse'].item(),
+            'adv_loss': losses['adv'].item(),
+            'disc_loss': losses['disc'].item(),
             'lr': self.optimizer.param_groups[0]['lr'],
             'embed_orig_top': embedding_info['orig'][0],
             'embed_orig_mid': embedding_info['orig'][1],
@@ -393,9 +465,15 @@ class ComprehensiveTrainer:
 
         vis_count = 0
         with torch.no_grad():
-            for images, labels in loader:
+            for batch in loader:
                 if vis_count >= num_samples:
                     break
+
+                if isinstance(batch, (list, tuple)) and len(batch) == 3:
+                    images, labels, filenames = batch
+                else:
+                    images, labels = batch
+                    filenames = None
 
                 images = images.to(self.device)
                 labels = labels.to(self.device)
@@ -407,6 +485,12 @@ class ComprehensiveTrainer:
 
                     img = images[sample_idx:sample_idx + 1]
                     lbl = labels[sample_idx:sample_idx + 1]
+                    img_name = None
+                    if filenames is not None:
+                        try:
+                            img_name = filenames[sample_idx]
+                        except Exception:
+                            img_name = None
 
                     cf_results = self._generate_counterfactuals(img, lbl, num_cf=3)
                     fig = self.visualizer.create_comparison_grid(
@@ -415,7 +499,8 @@ class ComprehensiveTrainer:
                         lbl.cpu(),
                         self.attr_names,
                         active_indices=self.active_attr_indices,
-                        active_names=self.active_attr_names
+                        active_names=self.active_attr_names,
+                        image_name=img_name
                     )
 
                     fig.savefig(
@@ -499,7 +584,9 @@ class ComprehensiveTrainer:
         checkpoint = {
             'epoch': epoch,
             'mutator_state': self.model.mutator.state_dict(),
+            'discriminator_state': self.discriminator.state_dict(),
             'optimizer_state': self.optimizer.state_dict(),
+            'opt_d_state': self.opt_d.state_dict(),
             'scaler_state': self.scaler.state_dict(),
             'global_step': self.global_step,
             'config': vars(self.cfg) if hasattr(self.cfg, '__dict__') else str(self.cfg)
@@ -635,7 +722,7 @@ def main():
     cfg = Config()
     
     loader_train = get_loader(cfg, split='train', batch_size=cfg.batch_size)
-    loader_val = get_loader(cfg, split='val', batch_size=cfg.batch_size)
+    loader_val = get_loader(cfg, split='val', batch_size=cfg.batch_size, return_filename=True)
     
     trainer = ComprehensiveTrainer(cfg, experiment_name="ceGAN_counterfactual")
     

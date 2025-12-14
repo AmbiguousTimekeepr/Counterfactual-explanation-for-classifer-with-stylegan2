@@ -43,7 +43,7 @@ class CelebADataset(Dataset):
                  image_size=128,
                  num_attributes=40,
                  transform=None,
-                 return_filename=False,
+                 return_filename=True,
                  use_eval_partition=False):
         """
         Args:
@@ -207,7 +207,7 @@ class CelebADataset(Dataset):
             return image, attrs
 
 
-def get_loader(cfg, split='train', batch_size=None, num_workers=None, shuffle=None):
+def get_loader(cfg, split='train', batch_size=None, num_workers=None, shuffle=None, return_filename=False):
     """
     Create a DataLoader for CelebA
     
@@ -233,6 +233,7 @@ def get_loader(cfg, split='train', batch_size=None, num_workers=None, shuffle=No
         split=split,
         image_size=cfg.image_size,
         num_attributes=cfg.num_attributes,
+        return_filename=return_filename,
         use_eval_partition=getattr(cfg, 'use_eval_partition', False)
     )
     

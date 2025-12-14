@@ -24,10 +24,9 @@ class LatentMutator(nn.Module):
                 nn.LeakyReLU(0.2, inplace=True),
                 nn.Linear(96, 64),
                 nn.LeakyReLU(0.2, inplace=True),
-                nn.Linear(64, num_levels),
-                nn.Softplus()
+                nn.Linear(64, num_levels)
             )
-            predictor[-2].bias.data.fill_(10.0)
+            predictor[-1].bias.data.fill_(2.5)
             self.step_predictors.append(predictor)
 
     def get_ig_features(self, ig_map):
@@ -85,7 +84,8 @@ class LatentMutator(nn.Module):
         sign = torch.sign(target - prob).view(batch_size, 1, 1, 1) # [B, 1, 1, 1]
         
         # 2. Get Direction Vector
-        direction = F.normalize(self.directions[active_attr_idx], dim=0).view(1, -1, 1, 1) # [1, C, 1, 1]
+        direction_vec = F.normalize(self.directions[active_attr_idx], dim=0)
+        direction = direction_vec.view(1, -1, 1, 1)  # [1, C, 1, 1]
 
         # 3. Calculate Step Size (Intensity)
         # Get IG stats [B, 8]
@@ -97,7 +97,9 @@ class LatentMutator(nn.Module):
         step_logits = self.step_predictors[active_attr_idx](step_input)
 
         for i, z in enumerate(z_list):
-            step = step_logits[:, i].view(batch_size, 1, 1, 1)
+            step_unscaled = step_logits[:, i]
+            step = torch.sigmoid(step_unscaled) * 1.3 + 0.2
+            step = step.view(batch_size, 1, 1, 1)
             step_values.append(step)
 
             mask = cam_masks[i].unsqueeze(1)

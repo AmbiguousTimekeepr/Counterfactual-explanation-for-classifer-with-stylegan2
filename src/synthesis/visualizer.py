@@ -71,7 +71,7 @@ class CounterfactualVisualizer:
         
         return overlaid
     
-    def create_comparison_grid(self, img_orig, cf_results, labels, attr_names, active_indices=None, active_names=None):
+    def create_comparison_grid(self, img_orig, cf_results, labels, attr_names, active_indices=None, active_names=None, image_name=None):
         """
         Create comprehensive comparison grid:
         Row 1: Original | CAM Overlay | (empty space)
@@ -82,6 +82,7 @@ class CounterfactualVisualizer:
             cf_results: dict with 'original', 'cfs' (list of dicts with 'image', 'attr_name', 'ig_map', 'cam_map')
             labels: [1, num_attributes] binary labels
             attr_names: list of attribute names
+            image_name: optional filename to annotate in the figure
         
         Returns:
             matplotlib figure
@@ -128,7 +129,11 @@ class CounterfactualVisualizer:
 
         label_np = labels[0].cpu().numpy().astype(int)
 
-        attr_text = "Active Attributes:\n" + "-" * 30 + "\n"
+        header_lines = []
+        if image_name:
+            header_lines.append(f"Image: {image_name}")
+        header_lines.append("Active Attributes:")
+        attr_text = "\n".join(header_lines) + "\n" + "-" * 30 + "\n"
         display_count = min(10, len(active_indices))
         for idx, name in zip(active_indices[:display_count], active_names[:display_count]):
             val = label_np[idx] if idx < label_np.shape[0] else 0
@@ -173,7 +178,8 @@ class CounterfactualVisualizer:
         ax_unused.axis('off')
 
         # Add overall title
-        fig.suptitle('Counterfactual Generation Results', fontsize=14, fontweight='bold', y=0.98)
+        title_suffix = f" — {image_name}" if image_name else ""
+        fig.suptitle(f"Counterfactual Generation Results{title_suffix}", fontsize=14, fontweight='bold', y=0.98)
         
         return fig
     

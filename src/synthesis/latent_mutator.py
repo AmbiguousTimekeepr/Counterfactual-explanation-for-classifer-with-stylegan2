@@ -26,7 +26,7 @@ class LatentMutator(nn.Module):
                 nn.LeakyReLU(0.2, inplace=True),
                 nn.Linear(64, num_levels)
             )
-            predictor[-1].bias.data.fill_(2.5)
+            predictor[-1].bias.data.fill_(5.0)
             self.step_predictors.append(predictor)
 
     def get_ig_features(self, ig_map):
@@ -96,15 +96,18 @@ class LatentMutator(nn.Module):
 
         step_logits = self.step_predictors[active_attr_idx](step_input)
 
-        for i, z in enumerate(z_list):
-            step_unscaled = step_logits[:, i]
-            step = torch.sigmoid(step_unscaled) * 1.3 + 0.2
-            step = step.view(batch_size, 1, 1, 1)
-            step_values.append(step)
+        steps = []
+        for level_idx in range(step_logits.size(1)):
+            step = torch.sigmoid(step_logits[:, level_idx]) * 1.3 + 0.2
+            steps.append(step)
 
-            mask = cam_masks[i].unsqueeze(1)
+        for level_idx, (z, step) in enumerate(zip(z_list, steps)):
+            step_reshaped = step.view(batch_size, 1, 1, 1)
+            step_values.append(step_reshaped)
 
-            delta = sign * step * direction * mask
-            z_mutated[i] = z + delta
+            mask = cam_masks[level_idx].unsqueeze(1)
+
+            delta = sign * step_reshaped * direction * mask
+            z_mutated[level_idx] = z + delta
 
         return z_mutated, step_values

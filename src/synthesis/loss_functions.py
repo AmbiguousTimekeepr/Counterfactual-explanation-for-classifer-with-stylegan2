@@ -28,11 +28,12 @@ class CounterfactualLossManager(nn.Module):
 
         self.base_weights = {
             'cf': 8.0,
-            'retention': 12.0,
+            'retention': 5.0,
             'latent_prox': 4.0,
             'ortho': 0.3,
             'sparse': 1e-3
         }
+        # Emphasize stability of coarse latents without over-penalizing detail layers
         self.latent_level_weights = [1.4, 1.0, 0.6]
 
     # ===============================================================
@@ -109,9 +110,18 @@ class CounterfactualLossManager(nn.Module):
         # L1 loss only in preserved regions
         l1 = (F.l1_loss(x_new, x_orig, reduction='none') * preserve_mask).mean()
         
-        # LPIPS loss
-        lpips_loss = self.lpips(x_new, x_orig)
-        lpips_loss = (lpips_loss * preserve_mask.mean(dim=[1, 2, 3])).mean()
+        # LPIPS loss (spatial weighting)
+        lpips_map = self.lpips(x_new, x_orig)  # [B, 1, H_lp, W_lp]
+        mask_down = F.interpolate(
+            preserve_mask,
+            size=lpips_map.shape[2:],
+            mode='bilinear',
+            align_corners=False
+        ).clamp(0, 1)
+
+        mask_weight = mask_down.sum(dim=[1, 2, 3]).clamp_min(1e-6)
+        lpips_weighted = (lpips_map * mask_down).sum(dim=[1, 2, 3]) / mask_weight
+        lpips_loss = lpips_weighted.mean()
 
         return l1 + lpips_loss * 0.8
 

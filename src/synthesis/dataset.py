@@ -43,7 +43,7 @@ class CelebADataset(Dataset):
                  image_size=128,
                  num_attributes=40,
                  transform=None,
-                 return_filename=True,
+                 return_filename=False,
                  use_eval_partition=False):
         """
         Args:

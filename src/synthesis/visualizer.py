@@ -134,12 +134,12 @@ class CounterfactualVisualizer:
             header_lines.append(f"Image: {image_name}")
         header_lines.append("Active Attributes:")
         attr_text = "\n".join(header_lines) + "\n" + "-" * 30 + "\n"
-        display_count = min(10, len(active_indices))
+        display_count = min(12, len(active_indices))
         for idx, name in zip(active_indices[:display_count], active_names[:display_count]):
             val = label_np[idx] if idx < label_np.shape[0] else 0
             attr_text += f"{name}: {val}\n"
         if len(active_indices) > display_count:
-            attr_text += "...\n(showing first 10)"
+            attr_text += "...\n(showing first 12)"
         
         ax3.text(0.1, 0.9, attr_text, transform=ax3.transAxes,
                 fontsize=9, verticalalignment='top', family='monospace',

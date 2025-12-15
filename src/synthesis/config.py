@@ -38,6 +38,9 @@ class Config(VQVAEConfig):
         self.num_attributes = len(SELECTED_ATTRIBUTES)
         self.num_classes = len(SELECTED_ATTRIBUTES)
         self.active_attributes = list(SELECTED_ATTRIBUTES)
+        self.max_active_attributes_per_epoch = 6
+        self.ig_steps = 16
+        self.saliency_cache_size = 512
         
         # ============================================================================
         # Synthesis-Specific Data Config

@@ -98,8 +98,11 @@ class LatentMutator(nn.Module):
 
         steps = []
         for level_idx in range(step_logits.size(1)):
-            step = torch.sigmoid(step_logits[:, level_idx]) * 1.3 + 0.2
+            step = torch.sigmoid(step_logits[:, level_idx]) * 2.5 + 0.1
             steps.append(step)
+
+        if len(steps) > 1:
+            steps[1] = steps[1] * 1.5
 
         for level_idx, (z, step) in enumerate(zip(z_list, steps)):
             step_reshaped = step.view(batch_size, 1, 1, 1)

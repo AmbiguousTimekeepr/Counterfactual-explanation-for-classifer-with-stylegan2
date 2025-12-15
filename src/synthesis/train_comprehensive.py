@@ -23,7 +23,6 @@ from .loss_functions import CounterfactualLossManager
 from .dataset import CelebADataset, get_loader, get_attribute_names
 from .visualizer import CounterfactualVisualizer
 from .discriminator_manager import PatchGANDiscriminator
-from ..classifiers.gradcam import GradCAMPlusPlus
 from ..classifiers.integrated_gradients import integrated_gradients
 
 
@@ -46,13 +45,8 @@ class ComprehensiveTrainer:
         # Initialize models
         self.init_models()
 
-        # XAI helpers (GradCAM++ & Integrated Gradients)
-        target_layer = getattr(self.model.classifier, 'cbam4', None)
-        if target_layer is None:
-            target_layer = self.model.classifier.layer4[-1]
-        self.gradcam_target_layer = target_layer
-        self.gradcam_pp = GradCAMPlusPlus(self.model.classifier, self.gradcam_target_layer)
-        self.gradcam_threshold = getattr(self.cfg, 'gradcam_threshold', 0.35)
+        # XAI helpers (Integrated Gradients + Sharpened mask)
+        self.mask_threshold = getattr(self.cfg, 'cam_threshold', 0.35)
         self.ig_steps = getattr(self.cfg, 'ig_steps', 16)
         self.saliency_cache = OrderedDict()
         self.saliency_cache_size = getattr(self.cfg, 'saliency_cache_size', 256)
@@ -125,7 +119,7 @@ class ComprehensiveTrainer:
         self.discriminator.train()
         self.opt_d = optim.AdamW(
             self.discriminator.parameters(),
-            lr=self.cfg.learning_rate * 0.5,
+            lr=self.cfg.learning_rate * 0.1,
             betas=(0.5, 0.999)
         )
         self.adv_weight = getattr(self.cfg, 'adv_weight', 1.0)
@@ -137,7 +131,7 @@ class ComprehensiveTrainer:
         if decoder_ckpt_path:
             ckpt_path = Path(decoder_ckpt_path)
             if ckpt_path.is_file():
-                self.model.decoder.load_state_dict(torch.load(ckpt_path, map_location=self.device))
+                self.model.load_decoder_checkpoint(ckpt_path, map_location=self.device)
                 self.decoder_pretrained = True
                 print(f"🧭 Loaded decoder weights from {ckpt_path}")
             else:
@@ -176,7 +170,7 @@ class ComprehensiveTrainer:
         fieldnames = [
             'epoch', 'batch', 'step', 'total_loss',
             'cf_loss', 'retention_loss', 'latent_prox_loss',
-            'ortho_loss', 'sparse_loss', 'adv_loss', 'disc_loss', 'lr',
+            'ortho_loss', 'sparse_loss', 'perc_loss', 'adv_loss', 'disc_loss', 'lr',
             'embed_orig_top', 'embed_orig_mid', 'embed_orig_bot',
             'embed_cf_top', 'embed_cf_mid', 'embed_cf_bot',
             'step_top', 'step_mid', 'step_bot'
@@ -191,7 +185,7 @@ class ComprehensiveTrainer:
         return get_attribute_names()
 
     def _compute_saliency_for_sample(self, image_tensor, attr_idx, target_class, cache_key=None):
-        """Compute IG map and GradCAM++ masks for a single sample with optional caching."""
+        """Compute IG map and sharpened retention masks for a single sample."""
         cached = self._cache_get(cache_key)
         if cached is not None:
             ig_cached, masks_cached, cam_cached = cached
@@ -209,57 +203,50 @@ class ComprehensiveTrainer:
             device=self.device
         )
 
-        ig_map = torch.abs(ig_attr).sum(dim=1)
-        flat_max = ig_map.view(ig_map.size(0), -1).amax(dim=1, keepdim=True).view(-1, 1, 1)
-        ig_map = ig_map / (flat_max + 1e-8)
-        ig_map = ig_map.squeeze(0).detach()
+        raw_saliency = torch.abs(ig_attr).sum(dim=1, keepdim=True)
+        flat_max = raw_saliency.view(raw_saliency.size(0), -1).amax(dim=1, keepdim=True).view(-1, 1, 1, 1)
+        ig_map = (raw_saliency / (flat_max + 1e-8)).squeeze(0).squeeze(0).detach()
 
-        self.gradcam_pp.register_hooks()
-        try:
-            cam_np = self.gradcam_pp.generate_cam(
-                image_tensor,
-                attribute_idx=attr_idx,
-                target_class=int(target_class)
-            )
-        finally:
-            self.gradcam_pp.remove_hooks()
-
-        cam_tensor = torch.from_numpy(cam_np).to(self.device).float()
-        if cam_tensor.ndim == 2:
-            cam_tensor = cam_tensor.unsqueeze(0)
-        cam_tensor = cam_tensor - cam_tensor.min()
-        cam_tensor = cam_tensor / (cam_tensor.max() + 1e-8)
-        cam_soft = F.interpolate(
-            cam_tensor.unsqueeze(0),
+        smooth = F.avg_pool2d(raw_saliency, kernel_size=11, stride=1, padding=5)
+        norm = smooth / (smooth.amax(dim=[1, 2, 3], keepdim=True) + 1e-8)
+        norm = norm.pow(1.5)
+        norm_map = F.interpolate(
+            norm,
             size=image_tensor.shape[-2:],
             mode='bilinear',
             align_corners=False
         ).squeeze(0).squeeze(0)
-        cam_soft = cam_soft.clamp(0.0, 1.0)
+        norm_map = norm_map.clamp(0.0, 1.0)
 
-        binary_mask = (cam_soft > self.gradcam_threshold).float()
+        binary_mask = (norm_map > self.mask_threshold).float()
         mask_t = F.interpolate(
             binary_mask.unsqueeze(0).unsqueeze(0),
-            size=(8, 8)
+            size=(8, 8),
+            mode='bilinear',
+            align_corners=False
         ).squeeze(0).squeeze(0)
         mask_m = F.interpolate(
             binary_mask.unsqueeze(0).unsqueeze(0),
-            size=(16, 16)
+            size=(16, 16),
+            mode='bilinear',
+            align_corners=False
         ).squeeze(0).squeeze(0)
         mask_b = F.interpolate(
             binary_mask.unsqueeze(0).unsqueeze(0),
-            size=(32, 32)
+            size=(32, 32),
+            mode='bilinear',
+            align_corners=False
         ).squeeze(0).squeeze(0)
 
         ig_to_store = ig_map.detach().cpu()
         masks_to_store = [mask_t.detach().cpu(), mask_m.detach().cpu(), mask_b.detach().cpu()]
-        cam_to_store = cam_soft.detach().cpu()
+        cam_to_store = norm_map.detach().cpu()
         self._cache_set(cache_key, (ig_to_store, masks_to_store, cam_to_store))
 
-        return ig_map, [mask_t.detach(), mask_m.detach(), mask_b.detach()], cam_soft.detach()
+        return ig_map, [mask_t.detach(), mask_m.detach(), mask_b.detach()], norm_map.detach()
 
     def _prepare_saliency_signals(self, images, target_labels, attr_idx, filenames=None):
-        """Compute IG maps and GradCAM++ masks for a batch."""
+        """Compute IG maps and sharpened retention masks for a batch."""
         ig_maps = []
         mask_levels = [[], [], []]
 
@@ -435,7 +422,7 @@ class ComprehensiveTrainer:
                     axes[1].axis('off')
 
                     axes[2].imshow(cam_overlay)
-                    axes[2].set_title("GradCAM++ Overlay")
+                    axes[2].set_title("Sharpened CAM Overlay")
                     axes[2].axis('off')
 
                     axes[3].imshow(cf_np)
@@ -475,7 +462,7 @@ class ComprehensiveTrainer:
         
         epoch_losses = {
             'total': [], 'cf': [], 'retention': [], 'latent_prox': [],
-            'ortho': [], 'sparse': [], 'adv': [], 'disc': []
+            'ortho': [], 'sparse': [], 'perc': [], 'adv': [], 'disc': []
         }
         attr_losses = {i: [] for i in self.active_attr_indices}
         
@@ -499,7 +486,7 @@ class ComprehensiveTrainer:
             target_labels[:, attr_idx] = 1 - target_labels[:, attr_idx]
             
             # ====================================================
-            # 1. XAI Extraction (GradCAM++ + Integrated Gradients)
+            # 1. XAI Extraction (IG + Sharpened Mask)
             # ====================================================
             filenames_batch = list(filenames) if filenames is not None else [None] * images.size(0)
             ig_map, masks = self._prepare_saliency_signals(
@@ -643,6 +630,7 @@ class ComprehensiveTrainer:
         self.writer.add_scalar('Loss/latent_prox', losses['latent_prox'].item(), self.global_step)
         self.writer.add_scalar('Loss/ortho', losses['ortho'].item(), self.global_step)
         self.writer.add_scalar('Loss/sparse', losses['sparse'].item(), self.global_step)
+        self.writer.add_scalar('Loss/perc', losses['perc'].item(), self.global_step)
         self.writer.add_scalar('Loss/adv', losses['adv'].item(), self.global_step)
         self.writer.add_scalar('Loss/disc', losses['disc'].item(), self.global_step)
         
@@ -656,6 +644,7 @@ class ComprehensiveTrainer:
             'latent_prox_loss': losses['latent_prox'].item(),
             'ortho_loss': losses['ortho'].item(),
             'sparse_loss': losses['sparse'].item(),
+            'perc_loss': losses['perc'].item(),
             'adv_loss': losses['adv'].item(),
             'disc_loss': losses['disc'].item(),
             'lr': self.optimizer.param_groups[0]['lr'],

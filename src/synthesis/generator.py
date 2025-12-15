@@ -6,6 +6,7 @@ from ..classifiers.model import ResNet50_CBAM
 from .latent_mutator import LatentMutator
 from .synthesis import HierarchicalSynthesisNet
 from pathlib import Path
+from collections import OrderedDict
 
 class CounterfactualGenerator(nn.Module):
     def __init__(self, cfg, vqvae_path, classifier_path, device='cuda'):
@@ -86,8 +87,7 @@ class CounterfactualGenerator(nn.Module):
         for candidate in sharpen_candidates:
             if candidate.is_file():
                 print(f"🔄 Loading Sharpened StyleGAN decoder from {candidate}...")
-                state_dict = torch.load(candidate, map_location=device)
-                self.decoder.load_state_dict(state_dict)
+                self.load_decoder_checkpoint(candidate, map_location=device)
                 decoder_loaded = True
                 break
 
@@ -97,7 +97,7 @@ class CounterfactualGenerator(nn.Module):
                 ckpt_path = Path(decoder_ckpt_path)
                 if ckpt_path.is_file():
                     print(f"🔍 Falling back to decoder weights at {ckpt_path}")
-                    self.decoder.load_state_dict(torch.load(ckpt_path, map_location=device))
+                    self.load_decoder_checkpoint(ckpt_path, map_location=device)
                     decoder_loaded = True
                 else:
                     print(f"⚠️ Decoder checkpoint not found at {ckpt_path}; starting with random weights.")
@@ -108,6 +108,62 @@ class CounterfactualGenerator(nn.Module):
             p.requires_grad = False
 
         self.mutator = LatentMutator(embed_dim=cfg.embed_dim, num_attributes=cfg.num_attributes).to(device)
+
+    def _prepare_decoder_state(self, raw_state):
+        """Normalize decoder checkpoints created before the dual-mapping refactor."""
+        if isinstance(raw_state, dict):
+            if 'state_dict' in raw_state:
+                state_dict = raw_state['state_dict']
+            elif 'model_state' in raw_state:
+                state_dict = raw_state['model_state']
+            else:
+                state_dict = OrderedDict((k, v) for k, v in raw_state.items() if isinstance(v, torch.Tensor))
+        else:
+            state_dict = raw_state
+
+        remapped = OrderedDict()
+        has_mapping_m = any(k.startswith('mapping_m') for k in state_dict.keys())
+
+        for key, tensor in state_dict.items():
+            new_key = key
+            if key.startswith('mapping.') and not key.startswith('mapping.net.'):
+                suffix = key.split('.', 1)[1]
+                new_key = f"mapping.net.{suffix}"
+            elif key.startswith('mapping_m.') and not key.startswith('mapping_m.net.'):
+                suffix = key.split('.', 1)[1]
+                new_key = f"mapping_m.net.{suffix}"
+
+            remapped[new_key] = tensor
+
+        if not has_mapping_m:
+            # Legacy checkpoints only had a single mapping network; mirror weights to mapping_m.
+            for key, tensor in list(remapped.items()):
+                if key.startswith('mapping.net.'):
+                    suffix = key.split('mapping.net.', 1)[1]
+                    mirror_key = f"mapping_m.net.{suffix}"
+                    remapped.setdefault(mirror_key, tensor.clone())
+
+        return remapped
+
+    def _report_decoder_load_issues(self, incompatible, source_path):
+        missing = incompatible.missing_keys
+        unexpected = incompatible.unexpected_keys
+        if not missing and not unexpected:
+            return
+
+        print(f"⚠️ Decoder load divergence for {source_path}:")
+        if missing:
+            print(f"   • Missing {len(missing)} keys (first 3): {[k for k in missing[:3]]}")
+        if unexpected:
+            print(f"   • Unexpected {len(unexpected)} keys (first 3): {[k for k in unexpected[:3]]}")
+
+    def load_decoder_checkpoint(self, checkpoint_path, map_location=None):
+        map_location = map_location or self.device
+        raw_state = torch.load(checkpoint_path, map_location=map_location)
+        state_dict = self._prepare_decoder_state(raw_state)
+        incompatible = self.decoder.load_state_dict(state_dict, strict=False)
+        self._report_decoder_load_issues(incompatible, checkpoint_path)
+        return incompatible
 
     def re_quantize(self, z, quantizer):
         """Standard quantization"""

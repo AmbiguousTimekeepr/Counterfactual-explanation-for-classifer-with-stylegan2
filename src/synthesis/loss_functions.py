@@ -27,11 +27,12 @@ class CounterfactualLossManager(nn.Module):
         self.std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
 
         self.base_weights = {
-            'cf': 8.0,
-            'retention': 5.0,
-            'latent_prox': 4.0,
-            'ortho': 0.3,
-            'sparse': 1e-3
+            'cf': 12.0,
+            'retention': 10.0,
+            'latent_prox': 3.0,
+            'ortho': 0.4,
+            'sparse': 1e-3,
+            'perc': 2.0
         }
         # Emphasize stability of coarse latents without over-penalizing detail layers
         self.latent_level_weights = [1.4, 1.0, 0.6]
@@ -193,15 +194,15 @@ class CounterfactualLossManager(nn.Module):
         losses['ortho'] = self.orthogonality_loss(directions)
         losses['sparse'] = self.direction_sparsity(directions)
 
-        perc_consistency = self.lpips(x_new, x_orig).mean() * 2.0
-        losses['perc_consistency'] = perc_consistency
+        perc_consistency = self.lpips(x_new, x_orig).mean()
+        losses['perc'] = perc_consistency
 
         total = (weights['cf'] * losses['cf'] +
              weights['retention'] * losses['retention'] +
              weights['latent_prox'] * losses['latent_prox'] +
              weights['ortho'] * losses['ortho'] +
              weights['sparse'] * losses['sparse'] +
-             perc_consistency)
+             weights['perc'] * losses['perc'])
 
         losses['total'] = total
         return losses

@@ -41,6 +41,7 @@ class Config(VQVAEConfig):
         self.max_active_attributes_per_epoch = 6
         self.ig_steps = 16
         self.saliency_cache_size = 512
+        self.cam_threshold = 0.35
         
         # ============================================================================
         # Synthesis-Specific Data Config

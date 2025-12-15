@@ -3,6 +3,24 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
+
+class MappingNetwork(nn.Module):
+    """MLP that converts quantized latents into StyleGAN w-space."""
+    def __init__(self, in_dim, style_dim, num_layers=6):
+        super().__init__()
+        layers = [nn.AdaptiveAvgPool2d(1), nn.Flatten()]
+        current_dim = in_dim
+        mlp = []
+        for _ in range(num_layers):
+            mlp.append(nn.Linear(current_dim, style_dim))
+            mlp.append(nn.LeakyReLU(0.2, inplace=True))
+            current_dim = style_dim
+        layers.extend(mlp)
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
 class ModulatedConv2d(nn.Module):
     """
     StyleGAN2-style Demodulated Convolution.
@@ -70,13 +88,9 @@ class HierarchicalSynthesisNet(nn.Module):
         super().__init__()
         self.style_dim = style_dim
 
-        layers = [nn.AdaptiveAvgPool2d(1), nn.Flatten()]
-        in_features = latent_dim
-        for _ in range(6):
-            layers.append(nn.Linear(in_features, style_dim))
-            layers.append(nn.LeakyReLU(0.2, inplace=True))
-            in_features = style_dim
-        self.mapping = nn.Sequential(*layers)
+        quant_dim = latent_dim
+        self.mapping = MappingNetwork(quant_dim, style_dim)
+        self.mapping_m = MappingNetwork(quant_dim, style_dim)
 
         self.input_projector = nn.Sequential(
             nn.Conv2d(latent_dim, 512, kernel_size=1),
@@ -103,7 +117,9 @@ class HierarchicalSynthesisNet(nn.Module):
 
     def forward(self, z_list, masks=None):
         z_t, z_m, z_b = z_list
-        w = self.mapping(z_t)
+        w_t = self.mapping(z_t)
+        w_m = self.mapping_m(z_m)
+        w = w_t + w_m
 
         x = self.input_projector(z_t)
 

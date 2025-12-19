@@ -1,15 +1,15 @@
 """
 Classifiers Module for CelebA Attribute Classification
 """
-from .model import ResNet50_CBAM, SquarePadResize
+from .model import ResNet18_CBAM, SquarePadResize
 from .dataset import CelebADataset
 from .gradcam import GradCAM, GradCAMPlusPlus, visualize_gradcam
-from .integrated_gradients import integrated_gradients, visualize_integrated_gradients
+from .integrated_gradients import integrated_gradients_batch, visualize_integrated_gradients
 from .inference import inference_single_image
 from .attributes import SELECTED_ATTRIBUTES
 
 __all__ = [
-    'ResNet50_CBAM',
+    'ResNet18_CBAM',
     'SquarePadResize',
     'CelebADataset',
     'GradCAM',

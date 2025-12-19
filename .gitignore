@@ -1,0 +1,14 @@
+# Exclude all checkpoint files
+outputs/**/*.pth
+# But keep the best model
+!outputs/synth_network/stylegan_decoder/latest.pth
+!outputs/**/best_resnet18_cbam_model.pth
+# Exclude visualize images
+outputs/**/*.png
+outputs/**/*.jpg
+# Exclude logs
+outputs/**/*.log
+# Exclude tensorboard files
+outputs/**/events.out.tfevents.*
+outputs/**/training_log.csv
+outputs/**/attr_stats*.json

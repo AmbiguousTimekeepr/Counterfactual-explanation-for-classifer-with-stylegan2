@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from ..unsupervised_latentspace.model import HVQVAE_3Level
-from ..classifiers.model import ResNet50_CBAM
+from ..classifiers.model import ResNet50_CBAM,ResNet18_CBAM
 from .latent_mutator import LatentMutator
 from .synthesis import HierarchicalSynthesisNet
 from pathlib import Path
@@ -41,14 +41,16 @@ class CounterfactualGenerator(nn.Module):
         for p in self.vqvae.parameters():
             p.requires_grad = False
 
-        self.classifier = ResNet50_CBAM(num_classes=cfg.num_classes).to(device)
-
+        self.classifier = ResNet18_CBAM(num_classes=cfg.num_classes).to(device)
+        print(f"Number of classes for classifier: {cfg.num_classes}")
         clf_ckpt = torch.load(classifier_path, map_location=device)
         if isinstance(clf_ckpt, dict):
             if 'model_state' in clf_ckpt:
                 clf_state = clf_ckpt['model_state']
             elif 'state_dict' in clf_ckpt:
                 clf_state = clf_ckpt['state_dict']
+            elif 'model_state_dict' in clf_ckpt:
+                clf_state = clf_ckpt['model_state_dict']
             else:
                 clf_state = {k: v for k, v in clf_ckpt.items() if isinstance(v, torch.Tensor)}
         else:

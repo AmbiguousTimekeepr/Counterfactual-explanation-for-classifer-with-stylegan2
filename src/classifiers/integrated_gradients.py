@@ -8,89 +8,82 @@ import matplotlib.pyplot as plt
 from PIL import Image
 
 
-def integrated_gradients(model, input_image, attribute_idx, target_class=1, 
-                        baseline=None, steps=50, device=None):
+def integrated_gradients_batch(
+    model,
+    input_batch: torch.Tensor,
+    attribute_idx: int,
+    target_classes: torch.Tensor,
+    steps: int = 50,
+    device: torch.device = None,
+    baseline: torch.Tensor = None
+) -> torch.Tensor:
     """
-    Tính Integrated Gradients cho một hình ảnh đầu vào.
+    Compute Integrated Gradients for a batch of images.
     
     Args:
-        model (torch.nn.Module): Mô hình CNN đã huấn luyện.
-        input_image (torch.Tensor): Ảnh đầu vào (1, C, H, W).
-        attribute_idx (int): Index của attribute cần giải thích.
-        target_class (int): 0 cho negative prediction, 1 cho positive prediction.
-        baseline (torch.Tensor): Ảnh nền (x'), mặc định là ảnh đen (zeros).
-        steps (int): Số bước tích phân (m), thường từ 20-300.
-        device: Device để tính toán.
+        model: Classifier model
+        input_batch: Input images [B, C, H, W]
+        attribute_idx: Index of the attribute to explain
+        target_classes: Target classes per sample [B]
+        steps: Number of interpolation steps
+        device: Computation device
+        baseline: Baseline tensor [B, C, H, W] or None (defaults to zeros)
     
     Returns:
-        ig_attributions: Attribution map (1, C, H, W)
+        Attributions tensor [B, C, H, W]
     """
-    model.eval()
-    
     if device is None:
-        device = next(model.parameters()).device
+        device = input_batch.device
     
-    input_image = input_image.to(device)
+    model.eval()
+    batch_size, C, H, W = input_batch.shape
     
-    # 1. Thiết lập Baseline (x') là ảnh đen nếu không cung cấp
     if baseline is None:
-        baseline = torch.zeros_like(input_image).to(device)
-    else:
-        baseline = baseline.to(device)
-
-    # Tính hiệu số (x - x')
-    diff = input_image - baseline
-
-    # 2. Tính Gradient cho từng ảnh nội suy (batched để tăng tốc)
-    batch_size = 10  # Chia nhỏ để tránh OOM
-    all_grads = []
+        baseline = torch.zeros_like(input_batch)
     
-    for start in range(0, steps + 1, batch_size):
-        end = min(start + batch_size, steps + 1)
-        
-        # Tạo các ảnh nội suy cho batch này
-        interpolated_images = []
-        for k in range(start, end):
-            alpha = k / steps
-            interpolated_image = baseline + alpha * diff
-            interpolated_images.append(interpolated_image)
-        
-        # Gộp thành batch
-        interpolated_inputs = torch.cat(interpolated_images, dim=0)
-        interpolated_inputs.requires_grad_(True)
-        
-        # Forward pass
-        outputs = model(interpolated_inputs)
-        
-        # Get score for specific attribute
-        score = outputs[:, attribute_idx].sum()
-        
-        # For negative class (class 0), invert the score
-        if target_class == 0:
-            score = -score
-        
-        # Backward
-        model.zero_grad()
-        score.backward()
-        
-        # Lấy gradient
-        grads = interpolated_inputs.grad.detach().clone()
-        all_grads.append(grads)
-        
-        # Clear
-        interpolated_inputs.grad = None
+    # Create interpolation alphas [steps]
+    alphas = torch.linspace(0, 1, steps, device=device)
     
-    # 3. Gộp tất cả gradients
-    all_grads = torch.cat(all_grads, dim=0)  # (steps+1, C, H, W)
+    # Expand dimensions for broadcasting
+    input_expanded = input_batch.unsqueeze(1)
+    baseline_expanded = baseline.unsqueeze(1)
+    alphas_expanded = alphas.view(1, steps, 1, 1, 1)
     
-    # 4. Tính tích phân xấp xỉ (trung bình các gradient)
-    avg_grads = torch.mean(all_grads, dim=0, keepdim=True)
+    # Interpolated inputs: [B, steps, C, H, W]
+    interpolated = baseline_expanded + alphas_expanded * (input_expanded - baseline_expanded)
     
-    # 5. Nhân với hiệu số đầu vào (x - x')
-    ig_attributions = diff * avg_grads
+    # Reshape for batch processing: [B * steps, C, H, W]
+    interpolated_flat = interpolated.view(batch_size * steps, C, H, W)
+    # ✅ Set requires_grad=True BEFORE forward pass
+    interpolated_flat = interpolated_flat.detach().requires_grad_(True)
     
-    return ig_attributions.detach()
-
+    # Forward pass
+    outputs = model(interpolated_flat)  # [B * steps, num_attrs]
+    
+    # Extract logits for target attribute: [B * steps]
+    logits = outputs[:, attribute_idx]
+    
+    # Compute gradients
+    grad_outputs = torch.ones_like(logits)
+    grads = torch.autograd.grad(
+        outputs=logits,
+        inputs=interpolated_flat,
+        grad_outputs=grad_outputs,
+        create_graph=False,
+        retain_graph=False
+    )[0]  # [B * steps, C, H, W]
+    
+    # Reshape gradients: [B, steps, C, H, W]
+    grads_reshaped = grads.view(batch_size, steps, C, H, W)
+    
+    # Riemann sum approximation (trapezoidal rule)
+    # Average gradients across steps: [B, C, H, W]
+    avg_grads = grads_reshaped.mean(dim=1)
+    
+    # Scale by input difference
+    attributions = (input_batch - baseline) * avg_grads
+    
+    return attributions
 
 def visualize_integrated_gradients(model, image_path, attribute_idx, attribute_name,
                                    transform, viz_transform, device, 
@@ -120,12 +113,12 @@ def visualize_integrated_gradients(model, image_path, attribute_idx, attribute_n
     original_padded = original_padded.permute(1, 2, 0).numpy()
     original_padded = (original_padded * 255).astype(np.uint8)
     
-    # Compute Integrated Gradients
-    ig_attr = integrated_gradients(
+    # Compute Integrated Gradients using batch function
+    ig_attr = integrated_gradients_batch(
         model=model,
-        input_image=input_tensor,
+        input_batch=input_tensor,
         attribute_idx=attribute_idx,
-        target_class=target_class,
+        target_classes=torch.tensor([int(target_class)], device=device),
         steps=steps,
         device=device
     )

@@ -119,3 +119,47 @@ class ResNet50_CBAM(nn.Module):
         x = torch.flatten(x, 1)
         x = self.fc(x)
         return x
+
+class ResNet18_CBAM(nn.Module):
+    def __init__(self, num_classes):
+        super(ResNet18_CBAM, self).__init__()
+        # Load pre-trained ResNet18
+        base_model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+        
+        # Tách các layer để chèn CBAM vào giữa các stage
+        self.stem = nn.Sequential(
+            base_model.conv1, base_model.bn1, base_model.relu, base_model.maxpool
+        )
+        self.layer1 = base_model.layer1
+        self.cbam1 = CBAMBlock(64) # ResNet18 layer1 out channels = 64
+        
+        self.layer2 = base_model.layer2
+        self.cbam2 = CBAMBlock(128) # ResNet18 layer2 out channels = 128
+        
+        self.layer3 = base_model.layer3
+        self.cbam3 = CBAMBlock(256) # ResNet18 layer3 out channels = 256
+        
+        self.layer4 = base_model.layer4
+        self.cbam4 = CBAMBlock(512) # ResNet18 layer4 out channels = 512
+        
+        self.avgpool = base_model.avgpool
+        self.fc = nn.Linear(512, num_classes)
+    def forward(self, x):
+        x = self.stem(x)
+        
+        x = self.layer1(x)
+        x = self.cbam1(x) # Apply CBAM
+        
+        x = self.layer2(x)
+        x = self.cbam2(x) # Apply CBAM
+        
+        x = self.layer3(x)
+        x = self.cbam3(x) # Apply CBAM
+        
+        x = self.layer4(x)
+        x = self.cbam4(x) # Apply CBAM
+        
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.fc(x)
+        return x

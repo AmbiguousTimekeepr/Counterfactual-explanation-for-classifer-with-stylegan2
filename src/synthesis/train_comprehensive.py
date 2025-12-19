@@ -23,11 +23,10 @@ from .loss_functions import CounterfactualLossManager
 from .dataset import CelebADataset, get_loader, get_attribute_names
 from .visualizer import CounterfactualVisualizer
 from .discriminator_manager import PatchGANDiscriminator
-from ..classifiers.integrated_gradients import integrated_gradients
-
+from ..classifiers.integrated_gradients import integrated_gradients_batch
 
 class ComprehensiveTrainer:
-    def __init__(self, cfg, experiment_name="counterfactual_training"):
+    def __init__(self, cfg, experiment_name="counterfactual_training", device=None):
         """
         Initialize comprehensive trainer with logging and visualization.
         
@@ -36,7 +35,10 @@ class ComprehensiveTrainer:
             experiment_name: Name for this experiment (used for directories)
         """
         self.cfg = cfg
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        if device is None:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = device
         self.experiment_name = experiment_name
         
         # Setup directories
@@ -72,7 +74,30 @@ class ComprehensiveTrainer:
         self.best_loss = float('inf')
         
         self.decoder_pretrained = False
-        
+    
+    def _make_cache_key(self, filename, attr_idx, target_class):
+        """Create a unique cache key for saliency computation."""
+        if filename is None:
+            return None
+        filename_str = str(filename) if not isinstance(filename, str) else filename
+        filename_safe = self._sanitize_filename(Path(filename_str).stem)
+        return f"{filename_safe}_{attr_idx}_{int(target_class)}"
+
+    def _cache_get(self, cache_key):
+        """Retrieve cached saliency signals."""
+        if cache_key is None:
+            return None
+        return self.saliency_cache.get(cache_key, None)
+
+    def _cache_set(self, cache_key, value):
+        """Store saliency signals in cache with LRU eviction."""
+        if cache_key is None:
+            return
+        self.saliency_cache[cache_key] = value
+        # LRU eviction: nếu cache quá lớn, xóa oldest entry
+        if len(self.saliency_cache) > self.saliency_cache_size:
+            self.saliency_cache.popitem(last=False)
+    
     def setup_directories(self):
         """Create output directories"""
         timestamp = datetime.now().strftime("%Y%m%d")
@@ -194,11 +219,12 @@ class ComprehensiveTrainer:
             cam_soft = cam_cached.to(self.device)
             return ig_map, masks, cam_soft
 
-        ig_attr = integrated_gradients(
+        # Use integrated_gradients_batch instead
+        ig_attr = integrated_gradients_batch(
             model=self.model.classifier,
-            input_image=image_tensor,
+            input_batch=image_tensor,
             attribute_idx=attr_idx,
-            target_class=int(target_class),
+            target_classes=torch.tensor([int(target_class)], device=self.device),
             steps=self.ig_steps,
             device=self.device
         )
@@ -246,82 +272,105 @@ class ComprehensiveTrainer:
         return ig_map, [mask_t.detach(), mask_m.detach(), mask_b.detach()], norm_map.detach()
 
     def _prepare_saliency_signals(self, images, target_labels, attr_idx, filenames=None):
-        """Compute IG maps and sharpened retention masks for a batch."""
-        ig_maps = []
-        mask_levels = [[], [], []]
-
+        """Compute IG maps and sharpened retention masks for a batch (vectorized)."""
         batch_size = images.size(0)
-        for sample_idx in range(batch_size):
-            tgt_class = target_labels[sample_idx, attr_idx].item()
-            cache_key = None
-            if filenames is not None:
-                cache_key = self._make_cache_key(filenames[sample_idx], attr_idx, tgt_class)
-            ig_single, masks_single, _ = self._compute_saliency_for_sample(
-                images[sample_idx:sample_idx + 1].detach(),
-                attr_idx,
-                tgt_class,
-                cache_key=cache_key
-            )
-            ig_maps.append(ig_single)
-            for level_idx, mask in enumerate(masks_single):
-                mask_levels[level_idx].append(mask)
-
-        ig_batch = torch.stack(ig_maps, dim=0)
-        masks_batch = [torch.stack(level, dim=0) for level in mask_levels]
-
-        return ig_batch, masks_batch
-
-    def _make_cache_key(self, filename, attr_idx, target_class):
-        """Create cache key derived from filename and attribute."""
-        if not filename:
-            return None
-        safe_name = self._sanitize_filename(Path(str(filename)).stem)
-        return f"{safe_name}|{attr_idx}|{int(target_class)}"
-
-    def _cache_get(self, key):
-        if key is None:
-            return None
-        cached = self.saliency_cache.get(key)
-        if cached is not None:
-            self.saliency_cache.move_to_end(key)
-        return cached
-
-    def _cache_set(self, key, value):
-        if key is None:
-            return
-        self.saliency_cache[key] = value
-        self.saliency_cache.move_to_end(key)
-        if len(self.saliency_cache) > self.saliency_cache_size:
-            self.saliency_cache.popitem(last=False)
-
-    def _tensor_to_image(self, tensor):
-        """Convert normalized tensor to numpy RGB image in [0, 1]."""
-        img = tensor.detach().cpu()
-        if img.dim() == 4:
-            img = img[0]
-        img = img.mul(0.5).add(0.5).clamp(0, 1)
-        return img.permute(1, 2, 0).numpy()
-
-    def _create_overlay(self, base_np, mask_tensor, alpha=0.6):
-        """Create overlay image between base RGB image and mask heatmap."""
-        if isinstance(mask_tensor, torch.Tensor):
-            mask_np = mask_tensor.detach().cpu().numpy()
+        device = images.device
+        
+        # Check cache for all samples first
+        cache_keys = []
+        cached_indices = []
+        uncached_indices = []
+        
+        target_classes = target_labels[:, attr_idx]  # [B]
+        
+        if filenames is not None:
+            for i in range(batch_size):
+                cache_key = self._make_cache_key(filenames[i], attr_idx, int(target_classes[i].item()))
+                cache_keys.append(cache_key)
+                cached = self._cache_get(cache_key)
+                if cached is not None:
+                    cached_indices.append((i, cached))
+                else:
+                    uncached_indices.append(i)
         else:
-            mask_np = mask_tensor
-        if mask_np.ndim == 3:
-            mask_np = mask_np[0]
-        mask_min = mask_np.min()
-        mask_max = mask_np.max()
-        if mask_max - mask_min < 1e-8:
-            mask_norm = np.zeros_like(mask_np)
-        else:
-            mask_norm = (mask_np - mask_min) / (mask_max - mask_min + 1e-8)
-        heatmap = cv2.applyColorMap(np.uint8(255 * mask_norm), cv2.COLORMAP_JET)
-        heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
-        base_uint = np.uint8(base_np * 255.0)
-        overlay = alpha * heatmap.astype(np.float32) + (1 - alpha) * base_uint.astype(np.float32)
-        overlay = np.clip(overlay / 255.0, 0.0, 1.0)
-        return overlay
+            cache_keys = [None] * batch_size
+            uncached_indices = list(range(batch_size))
+        
+        # Initialize output tensors
+        ig_maps = torch.zeros(batch_size, images.shape[-2], images.shape[-1], device=device)
+        mask_t = torch.zeros(batch_size, 8, 8, device=device)
+        mask_m = torch.zeros(batch_size, 16, 16, device=device)
+        mask_b = torch.zeros(batch_size, 32, 32, device=device)
+        
+        # Fill in cached results
+        for idx, (ig_cached, masks_cached, _) in cached_indices:
+            ig_maps[idx] = ig_cached.to(device)
+            mask_t[idx] = masks_cached[0].to(device)
+            mask_m[idx] = masks_cached[1].to(device)
+            mask_b[idx] = masks_cached[2].to(device)
+        
+        # Process uncached samples in batch
+        if uncached_indices:
+            uncached_images = images[uncached_indices]  # [U, C, H, W]
+            uncached_targets = target_classes[uncached_indices]  # [U]
+            
+            # Batch integrated gradients
+            ig_batch = integrated_gradients_batch(
+                model=self.model.classifier,
+                input_batch=uncached_images,
+                attribute_idx=attr_idx,
+                target_classes=uncached_targets,
+                steps=self.ig_steps,
+                device=device
+            )  # [U, C, H, W]
+            
+            # Compute IG maps (vectorized)
+            raw_saliency = torch.abs(ig_batch).sum(dim=1, keepdim=True)  # [U, 1, H, W]
+            flat_max = raw_saliency.view(raw_saliency.size(0), -1).amax(dim=1, keepdim=True)
+            flat_max = flat_max.view(-1, 1, 1, 1)
+            ig_normalized = (raw_saliency / (flat_max + 1e-8)).squeeze(1)  # [U, H, W]
+            
+            # Compute sharpened masks (vectorized)
+            smooth = F.avg_pool2d(raw_saliency, kernel_size=11, stride=1, padding=5)  # [U, 1, H, W]
+            norm = smooth / (smooth.amax(dim=[1, 2, 3], keepdim=True) + 1e-8)
+            norm = norm.pow(1.5)
+            norm_map = F.interpolate(
+                norm,
+                size=uncached_images.shape[-2:],
+                mode='bilinear',
+                align_corners=False
+            ).squeeze(1)  # [U, H, W]
+            norm_map = norm_map.clamp(0.0, 1.0)
+            
+            # Binary masks
+            binary_mask = (norm_map > self.mask_threshold).float()  # [U, H, W]
+            
+            # Resize to different scales (vectorized)
+            binary_4d = binary_mask.unsqueeze(1)  # [U, 1, H, W]
+            masks_t_batch = F.interpolate(binary_4d, size=(8, 8), mode='bilinear', align_corners=False).squeeze(1)
+            masks_m_batch = F.interpolate(binary_4d, size=(16, 16), mode='bilinear', align_corners=False).squeeze(1)
+            masks_b_batch = F.interpolate(binary_4d, size=(32, 32), mode='bilinear', align_corners=False).squeeze(1)
+            
+            # Fill in results and update cache
+            for local_idx, global_idx in enumerate(uncached_indices):
+                ig_maps[global_idx] = ig_normalized[local_idx].detach()
+                mask_t[global_idx] = masks_t_batch[local_idx].detach()
+                mask_m[global_idx] = masks_m_batch[local_idx].detach()
+                mask_b[global_idx] = masks_b_batch[local_idx].detach()
+                
+                # Cache the result
+                if cache_keys[global_idx] is not None:
+                    ig_to_store = ig_normalized[local_idx].detach().cpu()
+                    masks_to_store = [
+                        masks_t_batch[local_idx].detach().cpu(),
+                        masks_m_batch[local_idx].detach().cpu(),
+                        masks_b_batch[local_idx].detach().cpu()
+                    ]
+                    cam_to_store = norm_map[local_idx].detach().cpu()
+                    self._cache_set(cache_keys[global_idx], (ig_to_store, masks_to_store, cam_to_store))
+        
+        masks_batch = [mask_t, mask_m, mask_b]
+        return ig_maps, masks_batch
 
     def _sanitize_filename(self, name):
         """Sanitize filename component by keeping alphanumerics, dash, underscore."""
@@ -727,59 +776,59 @@ class ComprehensiveTrainer:
         inference_dir.mkdir(exist_ok=True)
 
         vis_count = 0
-        with torch.no_grad():
-            for batch in loader:
+        for batch in loader:
+            if vis_count >= num_samples:
+                break
+
+            if isinstance(batch, (list, tuple)) and len(batch) == 3:
+                images, labels, filenames = batch
+            else:
+                images, labels = batch
+                filenames = None
+
+            images = images.to(self.device)
+            labels = labels.to(self.device)
+
+            batch_size = images.size(0)
+            for sample_idx in range(batch_size):
                 if vis_count >= num_samples:
                     break
 
-                if isinstance(batch, (list, tuple)) and len(batch) == 3:
-                    images, labels, filenames = batch
-                else:
-                    images, labels = batch
-                    filenames = None
-
-                images = images.to(self.device)
-                labels = labels.to(self.device)
-
-                batch_size = images.size(0)
-                for sample_idx in range(batch_size):
-                    if vis_count >= num_samples:
-                        break
-
-                    img = images[sample_idx:sample_idx + 1]
-                    lbl = labels[sample_idx:sample_idx + 1]
-                    img_name = None
-                    if filenames is not None:
-                        try:
-                            img_name = filenames[sample_idx]
-                        except Exception:
-                            img_name = None
-
+                img = images[sample_idx:sample_idx + 1]
+                lbl = labels[sample_idx:sample_idx + 1]
+                img_name = None
+                if filenames is not None:
+                    try:
+                        img_name = filenames[sample_idx]
+                    except Exception:
+                        img_name = None
+                
+                with torch.enable_grad():
                     cf_results = self._generate_counterfactuals(img, lbl, num_cf=3, filename=img_name)
-                    fig = self.visualizer.create_comparison_grid(
-                        img.cpu(),
-                        cf_results,
-                        lbl.cpu(),
-                        self.attr_names,
-                        active_indices=self.active_attr_indices,
-                        active_names=self.active_attr_names,
-                        image_name=img_name
-                    )
+                fig = self.visualizer.create_comparison_grid(
+                    img.cpu(),
+                    cf_results,
+                    lbl.cpu(),
+                    self.attr_names,
+                    active_indices=self.active_attr_indices,
+                    active_names=self.active_attr_names,
+                    image_name=img_name
+                )
 
-                    base_name = img_name if img_name else f'sample_{vis_count:03d}'
-                    sanitized = base_name.replace('/', '_')
-                    fig.savefig(
-                        inference_dir / f'epoch_{epoch:03d}_{sanitized}_{vis_count:03d}.png',
-                        dpi=150,
-                        bbox_inches='tight'
-                    )
-                    self.writer.add_figure(
-                        f'Validation/sample_{vis_count}',
-                        fig,
-                        epoch
-                    )
-                    plt.close(fig)
-                    vis_count += 1
+                base_name = img_name if img_name else f'sample_{vis_count:03d}'
+                sanitized = base_name.replace('/', '_')
+                fig.savefig(
+                    inference_dir / f'epoch_{epoch:03d}_{sanitized}_{vis_count:03d}.png',
+                    dpi=150,
+                    bbox_inches='tight'
+                )
+                self.writer.add_figure(
+                    f'Validation/sample_{vis_count}',
+                    fig,
+                    epoch
+                )
+                plt.close(fig)
+                vis_count += 1
 
         self.model.mutator.train()
         print(f"🖼️ Validation samples logged: {vis_count}")

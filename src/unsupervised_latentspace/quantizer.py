@@ -15,10 +15,12 @@ class VectorQuantizerEMA(nn.Module):
         self.decay = decay
         self.epsilon = epsilon
 
-        # Initialize embeddings and EMA buffers
-        self.register_buffer('embedding', torch.randn(num_embeddings, embedding_dim))
+        init = torch.empty(num_embeddings, embedding_dim)
+        nn.init.normal_(init, mean=0.0, std=0.1)
+
+        self.register_buffer('embedding', init.clone())
         self.register_buffer('ema_cluster_size', torch.zeros(num_embeddings))
-        self.register_buffer('ema_w', torch.randn(num_embeddings, embedding_dim))
+        self.register_buffer('ema_w', init.clone())
 
     def forward(self, inputs):
         # inputs: [B, C, H, W] -> [B, H, W, C]
@@ -72,3 +74,42 @@ class VectorQuantizerEMA(nn.Module):
         # ✅ Return one-hot encodings [B*H*W, num_embeddings] for perplexity calculation
         # This avoids conversion overhead in trainer.py
         return quantized, loss, encodings
+
+    def revive_dead_codes(self, encoder_outputs_flat, threshold=5.0):
+        """
+        Revive dead codes by resetting them to current encoder outputs.
+        Called periodically during training.
+        """
+        with torch.no_grad():
+            if encoder_outputs_flat is None:
+                return
+
+            counts = self.ema_cluster_size
+            dead_mask = counts < threshold
+
+            if not dead_mask.any():
+                return
+
+            num_dead = int(dead_mask.sum().item())
+            encoder_outputs_flat = encoder_outputs_flat.to(self.embedding.device)
+            encoder_outputs_flat = encoder_outputs_flat.to(self.ema_w.dtype)
+
+            if encoder_outputs_flat.size(0) >= num_dead and num_dead > 0:
+                indices = torch.randint(0, encoder_outputs_flat.size(0), (num_dead,), device=self.embedding.device)
+                new_embeddings = encoder_outputs_flat[indices]
+            else:
+                live_mask = ~dead_mask
+                if live_mask.any():
+                    live_emb = self.embedding[live_mask]
+                    idx = torch.randint(0, live_emb.size(0), (num_dead,), device=self.embedding.device)
+                    new_embeddings = live_emb[idx]
+                    new_embeddings = new_embeddings + torch.randn_like(new_embeddings) * 0.05
+                else:
+                    new_embeddings = torch.randn(num_dead, self.embedding_dim, device=self.embedding.device, dtype=self.ema_w.dtype)
+
+            self.ema_w[dead_mask] = new_embeddings
+            self.ema_cluster_size[dead_mask] = threshold
+
+            updated_cluster_size = self.ema_cluster_size + self.epsilon
+            normalized = self.ema_w / updated_cluster_size.unsqueeze(1)
+            self.embedding.copy_(normalized)

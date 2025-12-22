@@ -13,6 +13,8 @@ from torchvision.utils import save_image, make_grid
 import math
 from collections import deque
 from datetime import datetime
+from copy import deepcopy
+from typing import Dict, Any
 import matplotlib.pyplot as plt
 import numpy as np
 from .metrics import MetricsCalculator, CodebookAnalyzer
@@ -219,6 +221,44 @@ def save_comparison_plot(original, stage1, stage2, stage3, save_path, num_sample
     except Exception as e:
         print(f"⚠️  Could not save comparison plot: {e}")
 
+
+def _module_state_to_cpu(module: torch.nn.Module) -> Dict[str, torch.Tensor]:
+    """Detach a module state dict to CPU for reuse in best-checkpoint artifacts."""
+    return {key: value.detach().cpu().clone() for key, value in module.state_dict().items()}
+
+
+def _optimizer_state_to_cpu(optimizer: optim.Optimizer) -> Dict[str, Any]:
+    """Clone optimizer state tensors to CPU so they can be serialized safely."""
+    state_dict = optimizer.state_dict()
+    cpu_state = deepcopy(state_dict)
+    for state in cpu_state.get("state", {}).values():
+        for key, value in state.items():
+            if torch.is_tensor(value):
+                state[key] = value.detach().cpu().clone()
+    return cpu_state
+
+
+def _save_best_artifacts(base_path: str, weights_state: Dict[str, torch.Tensor], payload: Dict[str, Any]) -> None:
+    """Persist inference-ready weights and the richer training payload for best checkpoints."""
+    torch.save(weights_state, base_path)
+
+    full_path = base_path.replace(".pth", "_full.pth")
+    torch.save(payload, full_path)
+
+    metrics_path = base_path.replace(".pth", "_metrics.pt")
+    torch.save(
+        {
+            "best_step": payload.get("best_step"),
+            "score": payload.get("score"),
+            "metrics": payload.get("metrics"),
+            "gan_active": payload.get("gan_active"),
+            "last_saved_step": payload.get("last_saved_step"),
+            "timestamp": payload.get("timestamp"),
+        },
+        metrics_path,
+    )
+
+
 def train():
     # 1. Setup - Create directory structure
     if not os.path.exists(cfg.save_dir):
@@ -276,7 +316,7 @@ def train():
     
     # ✅ NEW: Initialize metrics and visualization
     metrics_calc = MetricsCalculator(device=cfg.device)
-    codebook_analyzer = CodebookAnalyzer(num_embeddings=cfg.num_embeddings, num_levels=3)
+    codebook_analyzer = CodebookAnalyzer(num_embeddings=cfg.num_embeddings, num_levels=3, levels=cfg.levels)
     
     # 6. Training Loop
     model.train()
@@ -286,6 +326,16 @@ def train():
     dataloader_iter = iter(dataloader)
     nan_steps = 0
     max_nan_tolerance = 5
+
+    # Track best-performing checkpoints for both phases of training
+    best_nogan_score = float('-inf')
+    best_gan_score = float('-inf')
+    best_nogan_path = os.path.join(checkpoints_dir, "best.pth")
+    best_gan_path = os.path.join(checkpoints_dir, "best(gan).pth")
+    best_nogan_state_dict = None
+    best_gan_state_dict = None
+    best_nogan_payload: Dict[str, Any] = None  # type: ignore[assignment]
+    best_gan_payload: Dict[str, Any] = None  # type: ignore[assignment]
     
     with tqdm(total=cfg.total_steps, desc="Training", unit="step") as pbar:
         while step < cfg.total_steps:
@@ -395,8 +445,9 @@ def train():
             nan_steps = 0
             
             # Track losses
+            total_loss_value = loss_g.item()
             loss_tracker.add(
-                loss_g.item(),
+                total_loss_value,
                 recon_l.item(),
                 vq_l.item(),
                 perc_l.item(),
@@ -404,11 +455,31 @@ def train():
                 loss_d_val.item() if step >= cfg.disc_start_step else 0,
                 perplexity_val
             )
-            
             # Update progress bar
             step += 1
             pbar.update(1)
             
+            if cfg.codebook_reset_interval > 0 and step % cfg.codebook_reset_interval == 0:
+                print(f"Reviving dead codes at step {step}")
+                model.eval()
+                with torch.no_grad():
+                    feat_b = model.enc_b(images)
+                    feat_m = model.enc_m(feat_b)
+                    feat_t = model.enc_t(feat_m)
+
+                    z_t = model.quant_conv_t(feat_t)
+                    z_m = model.quant_conv_m(feat_m)
+                    z_b = model.quant_conv_b(feat_b)
+
+                    z_t_flat = z_t.permute(0, 2, 3, 1).reshape(-1, z_t.shape[1])
+                    z_m_flat = z_m.permute(0, 2, 3, 1).reshape(-1, z_m.shape[1])
+                    z_b_flat = z_b.permute(0, 2, 3, 1).reshape(-1, z_b.shape[1])
+
+                    model.quant_t.revive_dead_codes(z_t_flat, cfg.codebook_reset_threshold)
+                    model.quant_m.revive_dead_codes(z_m_flat, cfg.codebook_reset_threshold)
+                    model.quant_b.revive_dead_codes(z_b_flat, cfg.codebook_reset_threshold)
+                model.train()
+
             # Log every N steps
             if step % cfg.log_interval == 0:
                 avg_losses = loss_tracker.get_all_avg()
@@ -437,6 +508,84 @@ def train():
             
             # ✅ NEW: Save checkpoint + metrics + visualizations every N steps
             if step % cfg.save_interval == 0 and step > 0:
+                
+                            # Compute quality metrics for best-checkpoint scoring
+                with torch.no_grad():
+                    recon_det = recon.detach()
+                    images_det = images.detach()
+                    mse_val = F.mse_loss(recon_det, images_det).item()
+                    l1_val = F.l1_loss(recon_det, images_det).item()
+                    psnr_val = metrics_calc.psnr(images_det, recon_det).item()
+                    ssim_val = metrics_calc.ssim(images_det, recon_det).item()
+
+                # Composite score prioritising PSNR while balancing other metrics
+                score = (
+                    0.6 * psnr_val
+                    + 0.2 * (ssim_val * 100.0)
+                    + 0.1 * (1.0 / (1.0 + l1_val * 100.0))
+                    + 0.1 * (1.0 / (1.0 + mse_val * 1000.0))
+                )
+
+                # Persist best checkpoints for pre- and post-GAN phases using composite score
+                if step < cfg.disc_start_step:
+                    if score > best_nogan_score:
+                        best_nogan_score = score
+                        best_nogan_state_dict = _module_state_to_cpu(model)
+                        best_nogan_payload = {
+                            'best_step': step,
+                            'score': score,
+                            'metrics': {
+                                'psnr': psnr_val,
+                                'ssim': ssim_val,
+                                'mse': mse_val,
+                                'l1': l1_val,
+                                'score': score,
+                            },
+                            'gan_active': False,
+                            'timestamp': datetime.now().isoformat(),
+                            'last_saved_step': step,
+                            'model_state': best_nogan_state_dict,
+                            'discriminator_state': _module_state_to_cpu(discriminator),
+                            'optimizer_g_state': _optimizer_state_to_cpu(optimizer_g),
+                            'optimizer_d_state': _optimizer_state_to_cpu(optimizer_d),
+                            'total_loss': total_loss_value,
+                        }
+                        _save_best_artifacts(best_nogan_path, best_nogan_state_dict, best_nogan_payload)
+                        print(
+                            f"\n💾 New best checkpoint (no-GAN) at step {step} | "
+                            f"score: {score:.2f}, psnr: {psnr_val:.2f}, ssim: {ssim_val:.4f}"
+                            f" | saved weights to {os.path.basename(best_nogan_path)}"
+                        )
+                else:
+                    if score > best_gan_score:
+                        best_gan_score = score
+                        best_gan_state_dict = _module_state_to_cpu(model)
+                        best_gan_payload = {
+                            'best_step': step,
+                            'score': score,
+                            'metrics': {
+                                'psnr': psnr_val,
+                                'ssim': ssim_val,
+                                'mse': mse_val,
+                                'l1': l1_val,
+                                'score': score,
+                            },
+                            'gan_active': True,
+                            'timestamp': datetime.now().isoformat(),
+                            'last_saved_step': step,
+                            'model_state': best_gan_state_dict,
+                            'discriminator_state': _module_state_to_cpu(discriminator),
+                            'optimizer_g_state': _optimizer_state_to_cpu(optimizer_g),
+                            'optimizer_d_state': _optimizer_state_to_cpu(optimizer_d),
+                            'total_loss': total_loss_value,
+                        }
+                        _save_best_artifacts(best_gan_path, best_gan_state_dict, best_gan_payload)
+                        print(
+                            f"\n💾 New best checkpoint (GAN) at step {step} | "
+                            f"score: {score:.2f}, psnr: {psnr_val:.2f}, ssim: {ssim_val:.4f}"
+                            f" | saved weights to {os.path.basename(best_gan_path)}"
+                        )                
+                
                 # 1. Save checkpoint (existing logic)
                 checkpoint = {
                     'step': step,
@@ -496,6 +645,18 @@ def train():
                     print(f"   Metrics history: {os.path.basename(metrics_path)}")
                 except Exception as e:
                     print(f"⚠️  Could not save metrics: {e}")
+
+                if best_nogan_state_dict is not None and best_nogan_payload is not None:
+                    best_nogan_payload['last_saved_step'] = step
+                    best_nogan_payload['timestamp'] = datetime.now().isoformat()
+                    best_nogan_payload['model_state'] = best_nogan_state_dict
+                    _save_best_artifacts(best_nogan_path, best_nogan_state_dict, best_nogan_payload)
+
+                if best_gan_state_dict is not None and best_gan_payload is not None:
+                    best_gan_payload['last_saved_step'] = step
+                    best_gan_payload['timestamp'] = datetime.now().isoformat()
+                    best_gan_payload['model_state'] = best_gan_state_dict
+                    _save_best_artifacts(best_gan_path, best_gan_state_dict, best_gan_payload)
                 
                 # Print summary
                 print(f"\n✅ Step {step:,} Checkpoint:")
@@ -507,6 +668,18 @@ def train():
                           f"Mid usage={codebook_metrics.get('Mid_usage_ratio', 0):.1%}, "
                           f"Bottom usage={codebook_metrics.get('Bottom_usage_ratio', 0):.1%}")
     
+    if best_nogan_state_dict is not None and best_nogan_payload is not None:
+        best_nogan_payload['last_saved_step'] = step
+        best_nogan_payload['timestamp'] = datetime.now().isoformat()
+        best_nogan_payload['model_state'] = best_nogan_state_dict
+        _save_best_artifacts(best_nogan_path, best_nogan_state_dict, best_nogan_payload)
+
+    if best_gan_state_dict is not None and best_gan_payload is not None:
+        best_gan_payload['last_saved_step'] = step
+        best_gan_payload['timestamp'] = datetime.now().isoformat()
+        best_gan_payload['model_state'] = best_gan_state_dict
+        _save_best_artifacts(best_gan_path, best_gan_state_dict, best_gan_payload)
+
     print("\n" + "="*70)
     print("✅ HVQ-GAN TRAINING COMPLETED SUCCESSFULLY!")
     print("="*70)

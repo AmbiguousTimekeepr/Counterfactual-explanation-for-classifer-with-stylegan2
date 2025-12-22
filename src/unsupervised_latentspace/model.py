@@ -1,18 +1,8 @@
 import torch
 import torch.nn as nn
+from collections import OrderedDict
+from .decoder import HVQDecoder, ResBlock
 from .quantizer import VectorQuantizerEMA
-
-class ResBlock(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.block = nn.Sequential(
-            nn.ReLU(),
-            nn.Conv2d(in_channels, out_channels, 3, 1, 1),
-            nn.ReLU(),
-            nn.Conv2d(out_channels, out_channels, 1, 1, 0)
-        )
-    def forward(self, x):
-        return x + self.block(x)
 
 class Encoder(nn.Module):
     def __init__(self, in_channels, hidden_dim, num_res_blocks, stride):
@@ -26,20 +16,6 @@ class Encoder(nn.Module):
         self.model = nn.Sequential(*layers)
     def forward(self, x):
         return self.model(x)
-
-class DecoderBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, hidden_dim, num_res_blocks, stride):
-        super().__init__()
-        self.res_stack = nn.Sequential(
-            *[ResBlock(in_channels, in_channels) for _ in range(num_res_blocks)],
-            nn.ReLU()
-        )
-        self.up = nn.ConvTranspose2d(in_channels, out_channels, 4, stride, 1)
-        
-    def forward(self, x):
-        x = self.res_stack(x)
-        x = self.up(x)
-        return x
 
 class HVQVAE_3Level(nn.Module):
     def __init__(self, cfg):
@@ -62,20 +38,33 @@ class HVQVAE_3Level(nn.Module):
         self.quant_conv_m = nn.Conv2d(hd, ed, 1)
         self.quant_conv_b = nn.Conv2d(hd, ed, 1)
         
-        self.quant_t = VectorQuantizerEMA(cfg.num_embeddings, ed, cfg.commitment_cost, cfg.decay)
-        self.quant_m = VectorQuantizerEMA(cfg.num_embeddings, ed, cfg.commitment_cost, cfg.decay)
-        self.quant_b = VectorQuantizerEMA(cfg.num_embeddings, ed, cfg.commitment_cost, cfg.decay)
-        
-        # --- DECODERS ---
-        self.dec_t = DecoderBlock(ed, hd, hd, cfg.num_res_blocks, stride=2)
-        self.dec_m = DecoderBlock(hd + ed, hd, hd, cfg.num_res_blocks, stride=2)
-        self.dec_b = nn.Sequential(
-            nn.Conv2d(hd + ed, hd, 3, 1, 1),
-            *[ResBlock(hd, hd) for _ in range(cfg.num_res_blocks)],
-            nn.ConvTranspose2d(hd, hd//2, 4, 2, 1), nn.ReLU(),
-            nn.ConvTranspose2d(hd//2, cfg.in_channels, 4, 2, 1),
-            nn.Tanh()
+        self.quant_t = VectorQuantizerEMA(
+            num_embeddings=cfg.num_embeddings['top'],
+            embedding_dim=ed,
+            commitment_cost=cfg.commitment_cost['top'],
+            decay=cfg.ema_decay['top'],
+            epsilon=cfg.epsilon,
         )
+        self.quant_m = VectorQuantizerEMA(
+            num_embeddings=cfg.num_embeddings['mid'],
+            embedding_dim=ed,
+            commitment_cost=cfg.commitment_cost['mid'],
+            decay=cfg.ema_decay['mid'],
+            epsilon=cfg.epsilon,
+        )
+        self.quant_b = VectorQuantizerEMA(
+            num_embeddings=cfg.num_embeddings['bottom'],
+            embedding_dim=ed,
+            commitment_cost=cfg.commitment_cost['bottom'],
+            decay=cfg.ema_decay['bottom'],
+            epsilon=cfg.epsilon,
+        )
+        
+        # --- DECODER ---
+        self.decoder = HVQDecoder(cfg)
+        self.dec_t = self.decoder.dec_t
+        self.dec_m = self.decoder.dec_m
+        self.dec_b = self.decoder.dec_b
         
         # ✅ FIX: Initialize weights properly
         self._init_weights()
@@ -149,29 +138,7 @@ class HVQVAE_3Level(nn.Module):
         """
         # 1. Decode Top (8x8 -> 16x16)
         # dec_t uses ConvTranspose2d(stride=2), so 8x8 becomes 16x16
-        dec_t_out = self.dec_t(q_t)  # 8x8 -> 16x16
-        
-        # 2. Decode Mid (16x16 -> 32x32)
-        # Safety check: ensure dec_t_out is 16x16
-        if dec_t_out.shape[2:] != q_m.shape[2:]:
-            dec_t_out = torch.nn.functional.interpolate(
-                dec_t_out, size=q_m.shape[2:], mode='nearest'
-            )
-        
-        dec_m_in = torch.cat([dec_t_out, q_m], dim=1)  # [B, hd+ed, 16, 16]
-        dec_m_out = self.dec_m(dec_m_in)  # 16x16 -> 32x32
-        
-        # 3. Decode Bottom (32x32 -> 128x128)
-        # Safety check: ensure dec_m_out is 32x32
-        if dec_m_out.shape[2:] != q_b.shape[2:]:
-            dec_m_out = torch.nn.functional.interpolate(
-                dec_m_out, size=q_b.shape[2:], mode='nearest'
-            )
-        
-        dec_b_in = torch.cat([dec_m_out, q_b], dim=1)  # [B, hd+ed, 32, 32]
-        recon = self.dec_b(dec_b_in)  # 32x32 -> 128x128
-        
-        return recon
+        return self.decoder(q_t, q_m, q_b)
 
     def get_codes(self, x):
         """Helper to get quantized vectors for partial recon check"""
@@ -183,3 +150,13 @@ class HVQVAE_3Level(nn.Module):
         q_m, _, _ = self.quant_m(self.quant_conv_m(feat_m))
         q_b, _, _ = self.quant_b(self.quant_conv_b(feat_b))
         return q_t, q_m, q_b
+
+    def load_state_dict(self, state_dict, strict: bool = True):
+        remapped = OrderedDict()
+        for key, value in state_dict.items():
+            if key.startswith("dec_") and not key.startswith("decoder."):
+                new_key = f"decoder.{key}"
+                remapped[new_key] = value
+            else:
+                remapped[key] = value
+        return super().load_state_dict(remapped, strict=strict)

@@ -83,48 +83,62 @@ class MetricsCalculator:
 class CodebookAnalyzer:
     """Analyze VQ codebook usage and diversity"""
     
-    def __init__(self, num_embeddings, num_levels=3):
-        self.num_embeddings = num_embeddings
-        self.num_levels = num_levels
-        self.usage_counts = [torch.zeros(num_embeddings) for _ in range(num_levels)]
-        self.total_codes = [0] * num_levels
+    def __init__(self, num_embeddings, num_levels=3, levels=None):
+        if isinstance(num_embeddings, dict):
+            self.levels = levels if levels is not None else list(num_embeddings.keys())
+            self.num_embeddings = {lvl: int(num_embeddings[lvl]) for lvl in self.levels}
+        else:
+            self.levels = levels if levels is not None else [f'level_{i}' for i in range(num_levels)]
+            self.num_embeddings = {lvl: int(num_embeddings) for lvl in self.levels}
+
+        self.usage_counts = {lvl: torch.zeros(self.num_embeddings[lvl]) for lvl in self.levels}
+        self.total_codes = {lvl: 0 for lvl in self.levels}
     
     def update(self, indices_list):
         """Update codebook usage statistics
         
         Args:
-            indices_list: tuple of (ids_t, ids_m, ids_b) from model forward
+            indices_list: tuple of quantizer assignments following self.levels order
         """
-        for level, indices in enumerate(indices_list):
-            if indices is not None:
-                # ✅ FIX: Move indices to CPU before processing
-                indices_cpu = indices.cpu()
-                # Flatten indices and count usage
-                flat_indices = indices_cpu.view(-1)
-                for idx in flat_indices:
-                    self.usage_counts[level][int(idx)] += 1
-                self.total_codes[level] += flat_indices.shape[0]
+        if indices_list is None:
+            return
+
+        for level, indices in zip(self.levels, indices_list):
+            if indices is None:
+                continue
+
+            if indices.dim() >= 2 and indices.size(-1) == self.num_embeddings[level]:
+                flat_indices = indices.argmax(dim=-1).reshape(-1).to(torch.long)
+            else:
+                flat_indices = indices.reshape(-1).to(torch.long)
+
+            flat_indices_cpu = flat_indices.cpu()
+            usage = self.usage_counts[level]
+            for idx in flat_indices_cpu:
+                usage[int(idx)] += 1
+            self.total_codes[level] += flat_indices_cpu.numel()
     
     def get_diversity_metrics(self):
         """Calculate codebook diversity metrics"""
         metrics = {}
         
-        for level in range(self.num_levels):
-            if self.total_codes[level] == 0:
+        for level in self.levels:
+            total = self.total_codes[level]
+            if total == 0:
                 continue
             
-            # Usage ratio
-            used_codes = (self.usage_counts[level] > 0).sum().item()
-            usage_ratio = used_codes / self.num_embeddings
+            num_embeddings = self.num_embeddings[level]
+            usage_tensor = self.usage_counts[level]
+            used_codes = int((usage_tensor > 0).sum().item())
+            usage_ratio = used_codes / num_embeddings if num_embeddings > 0 else 0.0
             
-            # Entropy (measure of diversity)
-            probs = self.usage_counts[level] / self.total_codes[level]
-            probs = probs[probs > 0]  # Only non-zero probabilities
+            probs = usage_tensor / total
+            probs = probs[probs > 0]
             entropy = -torch.sum(probs * torch.log(probs)).item()
-            max_entropy = np.log(self.num_embeddings)
-            normalized_entropy = entropy / max_entropy if max_entropy > 0 else 0
-            
-            level_name = ['Top', 'Mid', 'Bottom'][level]
+            max_entropy = np.log(num_embeddings) if num_embeddings > 0 else 0.0
+            normalized_entropy = entropy / max_entropy if max_entropy > 0 else 0.0
+            level_name = level.capitalize()
+
             metrics[f'{level_name}_used_codes'] = used_codes
             metrics[f'{level_name}_usage_ratio'] = usage_ratio
             metrics[f'{level_name}_entropy'] = entropy

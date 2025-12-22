@@ -2,7 +2,7 @@ import torch
 import torch.optim as optim
 from torch.cuda.amp import GradScaler, autocast
 import torch.nn.functional as F
-from torch.utils.tensorboard import SummaryWriter
+from torch.utils.tensorboard.writer import SummaryWriter
 from tqdm import tqdm
 import random
 import numpy as np
@@ -101,7 +101,7 @@ class ComprehensiveTrainer:
     def setup_directories(self):
         """Create output directories"""
         timestamp = datetime.now().strftime("%Y%m%d")
-        self.exp_dir = Path(f"outputs/synth_network/CF_generator/{self.experiment_name}_{timestamp}")
+        self.exp_dir = Path(f"outputs/CF_generator/stylegan_decoder/{self.experiment_name}")
         self.exp_dir.mkdir(parents=True, exist_ok=True)
         
         self.checkpoint_dir = self.exp_dir / "checkpoints"

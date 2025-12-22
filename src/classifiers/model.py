@@ -1,5 +1,5 @@
 """
-ResNet50 + CBAM Classifier Model
+ResNet18 + CBAM Classifier Model
 """
 import torch
 import torch.nn as nn

@@ -13,7 +13,7 @@ from sklearn.model_selection import train_test_split
 
 # Import from classifiers module
 from classifiers import (
-    ResNet50_CBAM, 
+    ResNet18_CBAM, 
     SquarePadResize, 
     CelebADataset,
     visualize_gradcam,
@@ -85,8 +85,8 @@ def main():
     print(f"Train size: {len(train_dataset)} | Val size: {len(val_dataset)}")
 
     # --- MODEL SETUP ---
-    print(f"Initializing ResNet50 + CBAM on {DEVICE}...")
-    model = ResNet50_CBAM(num_classes=NUM_CLASSES)
+    print(f"Initializing ResNet18 + CBAM on {DEVICE}...")
+    model = ResNet18_CBAM(num_classes=NUM_CLASSES)
     model = model.to(DEVICE)
 
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weights_tensor)

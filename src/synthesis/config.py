@@ -28,7 +28,7 @@ class Config(VQVAEConfig):
         # ============================================================================
         # Model Paths (Pre-trained Checkpoints)
         # ============================================================================
-        self.vqvae_checkpoint = "outputs/checkpoints_production/checkpoints/checkpoint_step_22500.pth"
+        self.vqvae_checkpoint = "outputs/latent_space/checkpoints/best.pth"
         self.classifier_checkpoint = "outputs/cnn_classfier/best_model.pth"
         self.data_root = "Dataset/celeba_70percent_721"
         
@@ -39,7 +39,7 @@ class Config(VQVAEConfig):
         self.num_classes = len(SELECTED_ATTRIBUTES)
         self.active_attributes = list(SELECTED_ATTRIBUTES)
         self.max_active_attributes_per_epoch = 6
-        self.ig_steps = 16
+        self.ig_steps = 50
         self.saliency_cache_size = 512
         self.cam_threshold = 0.35
         
@@ -78,21 +78,21 @@ class Config(VQVAEConfig):
         # ============================================================================
         # Decoder Pretraining Settings
         # ============================================================================
-        self.decoder_pretrain_epochs = 10
+        self.decoder_pretrain_epochs = 3
         self.decoder_lr = 1e-3
         self.decoder_betas = (0.0, 0.99)
-        self.decoder_checkpoint_dir = "outputs/synth_network/stylegan_decoder"
-        self.decoder_checkpoint_path = ""
+        self.decoder_checkpoint_dir = "outputs/CF_generator/stylegan_decoder"
+        self.decoder_checkpoint_path = "outputs/CF_generator/stylegan_decoder/latest.pth"
         
         # ============================================================================
         # Decoder Sharpening Settings
         # ============================================================================   
-        self.sharpening_epochs = 15
-        self.g_sharpening_lr = 2e-4
-        self.d_sharpening_lr = 1e-5
+        self.sharpening_epochs = 5
+        self.g_sharpening_lr = 2e-5
+        self.d_sharpening_lr = 1e-6
         self.sharpening_betas = (0.0, 0.99)
-        self.sharpening_checkpoint_dir = "outputs/synth_network/stylegan_decoder_sharpened"
-        self.sharpened_decoder_path = ""
+        self.sharpening_checkpoint_dir = "outputs/CF_generator/stylegan_decoder_sharpened"
+        self.sharpened_decoder_path = "outputs/CF_generator/stylegan_decoder_sharpened/latest.pth"
         
         
     @classmethod

@@ -2,6 +2,9 @@
 outputs/**/*.pth
 # But keep the best model
 
+# Exclude all files from folder output
+outputs/
+
 # Exclude visualize images
 outputs/**/*.png
 outputs/**/*.jpg
@@ -11,3 +14,12 @@ outputs/**/*.log
 outputs/**/events.out.tfevents.*
 outputs/**/training_log.csv
 outputs/**/attr_stats*.json
+
+# Exclude dataset files
+Dataset/**/*.png
+Dataset/**/*.jpg
+Dataset/*
+
+
+# Exclude environment files
+cegan.venv/*

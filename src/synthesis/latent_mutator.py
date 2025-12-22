@@ -98,7 +98,7 @@ class LatentMutator(nn.Module):
 
         steps = []
         for level_idx in range(step_logits.size(1)):
-            step = torch.sigmoid(step_logits[:, level_idx]) * 2.5 + 0.1
+            step = torch.sigmoid(step_logits[:, level_idx]) * 2.5 + 0.5
             steps.append(step)
 
         if len(steps) > 1:

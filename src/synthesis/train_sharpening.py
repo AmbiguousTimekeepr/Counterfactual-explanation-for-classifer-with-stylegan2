@@ -61,7 +61,7 @@ def train_sharpening(checkpoint_path: str | None = None, cfg: Config | None = No
     )
 
     if checkpoint_path is None:
-        checkpoint_path = getattr(cfg, "decoder_checkpoint_path", "outputs/stylegan_decoder/latest.pth")
+        checkpoint_path = getattr(cfg, "decoder_checkpoint_path", "outputs/CF_generator/stylegan_decoder/latest.pth")
     decoder_path = Path(checkpoint_path)
     if decoder_path.is_file():
         print(f"🔄 Loading pre-trained decoder for sharpening: {decoder_path}")
@@ -74,8 +74,18 @@ def train_sharpening(checkpoint_path: str | None = None, cfg: Config | None = No
     discriminator = PatchGANDiscriminator().to(device)
     ema = EMA(model.decoder, decay=0.999)
 
+    # Ensure decoder parameters require gradients for sharpening phase
+    for p in model.decoder.parameters():
+        p.requires_grad = True
+    model.decoder.train()
+
     opt_g = optim.Adam(model.decoder.parameters(), lr=cfg.g_sharpening_lr, betas=cfg.sharpening_betas)
     opt_d = optim.Adam(discriminator.parameters(), lr=cfg.d_sharpening_lr, betas=cfg.sharpening_betas)
+
+    # Sharpening loss weights (configurable via cfg attributes if present)
+    adv_weight = getattr(cfg, 'sharpening_adv_weight', 0.05)   # lower adversarial contribution
+    lpips_weight = getattr(cfg, 'sharpening_lpips_weight', 1.5) # slightly increase LPIPS weight
+    consistency_weight = getattr(cfg, 'sharpening_consistency_weight', 0.5)  # mild consistency loss
 
     scaler = GradScaler()
     loss_l1 = torch.nn.L1Loss()
@@ -84,7 +94,7 @@ def train_sharpening(checkpoint_path: str | None = None, cfg: Config | None = No
     loader = get_loader(cfg, split="train", batch_size=8)
     sample_imgs = _prepare_visualization_samples(cfg, device, loader)
 
-    checkpoint_root = getattr(cfg, "sharpening_checkpoint_dir", "") or "outputs/synth_network/stylegan_decoder_sharpened"
+    checkpoint_root = getattr(cfg, "sharpening_checkpoint_dir", "") or "outputs/CF_generator/stylegan_decoder_sharpened"
     vis_dir = Path(checkpoint_root) / "samples"
 
     print("🚀 Starting adversarial sharpening phase...")
@@ -120,7 +130,13 @@ def train_sharpening(checkpoint_path: str | None = None, cfg: Config | None = No
                 l1 = loss_l1(fake_imgs_g, imgs)
                 perc = loss_lpips(fake_imgs_g, imgs).mean()
 
-                loss_g = g_adv * 0.1 + l1 * 10.0 + perc * 1.0
+                # Consistency target: EMA-smoothed decoder output for the same codes
+                with torch.no_grad():
+                    ema_out = ema.model(z_list)
+
+                consistency = F.mse_loss(fake_imgs_g, ema_out)
+
+                loss_g = g_adv * adv_weight + l1 * 10.0 + perc * lpips_weight + consistency * consistency_weight
 
             scaler.scale(loss_g).backward()
             scaler.step(opt_g)
@@ -133,6 +149,7 @@ def train_sharpening(checkpoint_path: str | None = None, cfg: Config | None = No
                 "G_Adv": g_adv.item(),
                 "L1": l1.item(),
                 "LPIPS": perc.item(),
+                "CONS": float(consistency.item()),
             })
 
         if epoch % 2 == 0:

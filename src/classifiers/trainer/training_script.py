@@ -16,7 +16,7 @@ from tqdm import tqdm
 
 from ..attributes import SELECTED_ATTRIBUTES
 from ..dataset import CelebADataset
-from ..model import ResNet50_CBAM, SquarePadResize
+from ..model import ResNet18_CBAM, ResNet50_CBAM, SquarePadResize
 
 
 def build_dataloaders(
@@ -82,13 +82,13 @@ def build_dataloaders(
 
 
 def create_model(num_classes: int, device: torch.device) -> nn.Module:
-    """Initialise the ResNet50 + CBAM model."""
+    """Initialise the ResNet18 + CBAM model."""
 
-    model = ResNet50_CBAM(num_classes=num_classes)
+    model = ResNet18_CBAM(num_classes=num_classes)
     return model.to(device)
 
 
-def train_resnet50_cbam(
+def train_resnet18_cbam(
     model: nn.Module,
     train_loader: DataLoader,
     val_loader: DataLoader,
@@ -255,7 +255,7 @@ def main() -> None:
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=7, gamma=0.1)
 
-    history = train_resnet50_cbam(
+    history = train_resnet18_cbam(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,

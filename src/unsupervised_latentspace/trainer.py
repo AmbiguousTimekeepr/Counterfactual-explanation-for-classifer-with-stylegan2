@@ -229,10 +229,15 @@ def train():
     samples_dir = os.path.join(cfg.save_dir, "samples")
     logs_dir = os.path.join(cfg.save_dir, "logs")
     metrics_viz_dir = os.path.join(cfg.save_dir, "metrics_and_visualisations")
+    gan_csv_path = os.path.join(logs_dir, "gan_loss_log.csv")
     
     for dir_path in [checkpoints_dir, samples_dir, logs_dir, metrics_viz_dir]:
         if not os.path.exists(dir_path):
             os.makedirs(dir_path)
+
+    if not os.path.exists(gan_csv_path):
+        with open(gan_csv_path, "w") as f:
+            f.write("step,loss_g,adv_g,disc_d,recon,vq,perc,perplexity\n")
         
     print("="*70)
     print("🔧 HVQ-GAN TRAINING V3 (Step-based, Unsupervised)")
@@ -354,8 +359,9 @@ def train():
                         print(f"⚠️  Warning: Could not calculate perplexity at step {step}: {e}")
                         perplexity_val = 0.0
                 
+                disc_active = step >= cfg.disc_start_step
                 loss_disc_gen = torch.tensor(0.0, device=images.device)
-                if step >= cfg.disc_start_step:
+                if disc_active:
                     disc_recon = discriminator(recon)
                     loss_disc_gen = -disc_recon.mean()
                 
@@ -369,7 +375,7 @@ def train():
             
             # ========== DISCRIMINATOR UPDATE ==========
             loss_d_val = 0.0
-            if step >= cfg.disc_start_step:
+            if disc_active:
                 optimizer_d.zero_grad()
                 
                 with autocast(enabled=cfg.use_amp):
@@ -400,14 +406,22 @@ def train():
                 recon_l.item(),
                 vq_l.item(),
                 perc_l.item(),
-                loss_disc_gen.item() if step >= cfg.disc_start_step else 0,
-                loss_d_val.item() if step >= cfg.disc_start_step else 0,
+                loss_disc_gen.item() if disc_active else 0,
+                loss_d_val.item() if disc_active and torch.is_tensor(loss_d_val) else 0,
                 perplexity_val
             )
             
             # Update progress bar
             step += 1
             pbar.update(1)
+
+            adv_val = loss_disc_gen.item() if disc_active else 0.0
+            disc_val = loss_d_val.item() if disc_active and torch.is_tensor(loss_d_val) else 0.0
+            with open(gan_csv_path, "a") as f:
+                f.write(
+                    f"{step},{loss_g.item():.6f},{adv_val:.6f},{disc_val:.6f},"
+                    f"{recon_l.item():.6f},{vq_l.item():.6f},{perc_l.item():.6f},{perplexity_val:.6f}\n"
+                )
             
             # Log every N steps
             if step % cfg.log_interval == 0:

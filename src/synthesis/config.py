@@ -42,6 +42,7 @@ class Config(VQVAEConfig):
         self.ig_steps = 16
         self.saliency_cache_size = 512
         self.cam_threshold = 0.35
+        self.use_ig = True
         
         # ============================================================================
         # Synthesis-Specific Data Config
@@ -56,7 +57,7 @@ class Config(VQVAEConfig):
             'cf': 10.0,
             'retention': 15.0,
             'latent_prox': 5.0,
-            'ortho': 0.3,
+            'ortho': 0.5,
             'sparse': 1e-3
         }
         

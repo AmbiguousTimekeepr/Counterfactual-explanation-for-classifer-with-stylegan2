@@ -62,7 +62,7 @@ def integrated_gradients_batch(
     
     # Extract logits for target attribute: [B * steps]
     logits = outputs[:, attribute_idx]
-    
+
     # Compute gradients
     grad_outputs = torch.ones_like(logits)
     grads = torch.autograd.grad(

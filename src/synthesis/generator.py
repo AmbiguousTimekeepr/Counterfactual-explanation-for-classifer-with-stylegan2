@@ -41,30 +41,21 @@ class CounterfactualGenerator(nn.Module):
         for p in self.vqvae.parameters():
             p.requires_grad = False
 
-        self.classifier = ResNet18_CBAM(num_classes=cfg.num_classes).to(device)
-        print(f"Number of classes for classifier: {cfg.num_classes}")
         clf_ckpt = torch.load(classifier_path, map_location=device)
-        if isinstance(clf_ckpt, dict):
-            if 'model_state' in clf_ckpt:
-                clf_state = clf_ckpt['model_state']
-            elif 'state_dict' in clf_ckpt:
-                clf_state = clf_ckpt['state_dict']
-            elif 'model_state_dict' in clf_ckpt:
-                clf_state = clf_ckpt['model_state_dict']
-            else:
-                clf_state = {k: v for k, v in clf_ckpt.items() if isinstance(v, torch.Tensor)}
-        else:
-            clf_state = clf_ckpt
+        clf_state = self._extract_state_dict(clf_ckpt)
+
+        classifier_cls = self._infer_classifier_cls(clf_state)
+        self.classifier = classifier_cls(num_classes=cfg.num_classes).to(device)
+        print(f"Number of classes for classifier: {cfg.num_classes} | Using {classifier_cls.__name__}")
 
         incompatible = self.classifier.load_state_dict(clf_state, strict=False)
-        if incompatible.missing_keys:
-            print(f"⚠️ Classifier missing {len(incompatible.missing_keys)} keys (first 3 shown):")
-            for k in incompatible.missing_keys[:3]:
-                print(f"   • {k}")
-        if incompatible.unexpected_keys:
-            print(f"⚠️ Classifier unexpected {len(incompatible.unexpected_keys)} keys (first 3 shown):")
-            for k in incompatible.unexpected_keys[:3]:
-                print(f"   • {k}")
+        if incompatible.missing_keys or incompatible.unexpected_keys:
+            msg = []
+            if incompatible.missing_keys:
+                msg.append(f"missing {len(incompatible.missing_keys)} keys (first 3): {incompatible.missing_keys[:3]}")
+            if incompatible.unexpected_keys:
+                msg.append(f"unexpected {len(incompatible.unexpected_keys)} keys (first 3): {incompatible.unexpected_keys[:3]}")
+            raise RuntimeError(f"Classifier checkpoint does not match model: {'; '.join(msg)}")
 
         self.classifier.eval()
         for p in self.classifier.parameters():
@@ -110,6 +101,25 @@ class CounterfactualGenerator(nn.Module):
             p.requires_grad = False
 
         self.mutator = LatentMutator(embed_dim=cfg.embed_dim, num_attributes=cfg.num_attributes).to(device)
+
+    @staticmethod
+    def _extract_state_dict(ckpt):
+        if isinstance(ckpt, dict):
+            if 'model_state' in ckpt:
+                return ckpt['model_state']
+            if 'state_dict' in ckpt:
+                return ckpt['state_dict']
+            if 'model_state_dict' in ckpt:
+                return ckpt['model_state_dict']
+            # fallback: tensor-like entries
+            return {k: v for k, v in ckpt.items() if isinstance(v, torch.Tensor)}
+        return ckpt
+
+    @staticmethod
+    def _infer_classifier_cls(state_dict):
+        # Heuristic: ResNet50 checkpoints (Bottleneck) contain conv3 in layer blocks
+        has_conv3 = any("conv3" in k for k in state_dict.keys())
+        return ResNet50_CBAM if has_conv3 else ResNet18_CBAM
 
     def _prepare_decoder_state(self, raw_state):
         """Normalize decoder checkpoints created before the dual-mapping refactor."""

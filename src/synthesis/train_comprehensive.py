@@ -50,6 +50,7 @@ class ComprehensiveTrainer:
         # XAI helpers (Integrated Gradients + Sharpened mask)
         self.mask_threshold = getattr(self.cfg, 'cam_threshold', 0.35)
         self.ig_steps = getattr(self.cfg, 'ig_steps', 16)
+        self.use_ig = getattr(self.cfg, 'use_ig', True)
         self.saliency_cache = OrderedDict()
         self.saliency_cache_size = getattr(self.cfg, 'saliency_cache_size', 256)
         
@@ -101,7 +102,8 @@ class ComprehensiveTrainer:
     def setup_directories(self):
         """Create output directories"""
         timestamp = datetime.now().strftime("%Y%m%d")
-        self.exp_dir = Path(f"outputs/synth_network/CF_generator/{self.experiment_name}_{timestamp}")
+        suffix = "_no_ig" if not self.cfg.use_ig else ""
+        self.exp_dir = Path(f"outputs/synth_network/CF_generator/{self.experiment_name}_{timestamp}{suffix}")
         self.exp_dir.mkdir(parents=True, exist_ok=True)
         
         self.checkpoint_dir = self.exp_dir / "checkpoints"
@@ -147,7 +149,8 @@ class ComprehensiveTrainer:
             lr=self.cfg.learning_rate * 0.1,
             betas=(0.5, 0.999)
         )
-        self.adv_weight = getattr(self.cfg, 'adv_weight', 1.0)
+        self.adv_weight = getattr(self.cfg, 'adv_weight', 0.5)
+        print(f"Adversarial loss weight: {self.adv_weight}")
         
         self.scaler = GradScaler()
         self.decoder_pretrained = False
@@ -211,6 +214,15 @@ class ComprehensiveTrainer:
 
     def _compute_saliency_for_sample(self, image_tensor, attr_idx, target_class, cache_key=None):
         """Compute IG map and sharpened retention masks for a single sample."""
+        if not self.use_ig:
+            h, w = image_tensor.shape[-2:]
+            ig_map = torch.ones(h, w, device=image_tensor.device)
+            mask_t = torch.ones(8, 8, device=image_tensor.device)
+            mask_m = torch.ones(16, 16, device=image_tensor.device)
+            mask_b = torch.ones(32, 32, device=image_tensor.device)
+            cam_soft = torch.zeros(h, w, device=image_tensor.device)
+            return ig_map, [mask_t, mask_m, mask_b], cam_soft
+
         cached = self._cache_get(cache_key)
         if cached is not None:
             ig_cached, masks_cached, cam_cached = cached
@@ -275,6 +287,14 @@ class ComprehensiveTrainer:
         """Compute IG maps and sharpened retention masks for a batch (vectorized)."""
         batch_size = images.size(0)
         device = images.device
+
+        if not self.use_ig:
+            h, w = images.shape[-2:]
+            ig_maps = torch.ones(batch_size, h, w, device=device)
+            mask_t = torch.ones(batch_size, 8, 8, device=device)
+            mask_m = torch.ones(batch_size, 16, 16, device=device)
+            mask_b = torch.ones(batch_size, 32, 32, device=device)
+            return ig_maps, [mask_t, mask_m, mask_b]
         
         # Check cache for all samples first
         cache_keys = []
@@ -505,6 +525,8 @@ class ComprehensiveTrainer:
     
     def train_epoch(self, epoch, loader):
         """Train for one epoch with comprehensive logging"""
+        # Reset saliency/mask cache each epoch to avoid reusing stale IG maps
+        self.saliency_cache.clear()
         self.model.mutator.train()
         self.model.decoder.train()
         self.discriminator.train()
@@ -767,17 +789,16 @@ class ComprehensiveTrainer:
             json.dump(attr_stats, f, indent=2)
     
     def validate_and_visualize(self, epoch, loader, num_samples=4):
-        """Generate visualizations during validation"""
+        """Visualize original, saliency overlay, and counterfactual for a few samples each epoch."""
+        # Ensure validation uses fresh saliency computations
+        self.saliency_cache.clear()
         self.model.mutator.eval()
-
-        print(f"\n🎨 Generating visualizations for epoch {epoch}...")
-
-        inference_dir = self.vis_dir / "validation"
+        inference_dir = self.vis_dir / "validation_simple"
         inference_dir.mkdir(exist_ok=True)
 
-        vis_count = 0
+        logged = 0
         for batch in loader:
-            if vis_count >= num_samples:
+            if logged >= num_samples:
                 break
 
             if isinstance(batch, (list, tuple)) and len(batch) == 3:
@@ -789,49 +810,159 @@ class ComprehensiveTrainer:
             images = images.to(self.device)
             labels = labels.to(self.device)
 
-            batch_size = images.size(0)
-            for sample_idx in range(batch_size):
-                if vis_count >= num_samples:
+            for i in range(images.size(0)):
+                if logged >= num_samples:
                     break
 
-                img = images[sample_idx:sample_idx + 1]
-                lbl = labels[sample_idx:sample_idx + 1]
-                img_name = None
-                if filenames is not None:
-                    try:
-                        img_name = filenames[sample_idx]
-                    except Exception:
-                        img_name = None
-                
-                with torch.enable_grad():
-                    cf_results = self._generate_counterfactuals(img, lbl, num_cf=3, filename=img_name)
-                fig = self.visualizer.create_comparison_grid(
-                    img.cpu(),
-                    cf_results,
-                    lbl.cpu(),
-                    self.attr_names,
-                    active_indices=self.active_attr_indices,
-                    active_names=self.active_attr_names,
-                    image_name=img_name
-                )
+                img = images[i:i+1]
+                lbl = labels[i:i+1]
+                name = filenames[i] if filenames is not None else f"sample_{logged:03d}"
+                sanitized = self._sanitize_filename(str(name))
+#                            self.attr_names.index('Brown_Hair')
+#                            self.attr_names.index('Mouth_Slightly_Open'),
+#                            self.attr_names.index('Eyeglasses')
+                # Chọn attr ngẫu nhiên như trong _generate_counterfactuals
+                # attr_idx = random.choice(self.active_attr_indices)
+                attr_list = [self.attr_names.index('Mustache'),
+                ]
+                attr_idx = attr_list[logged % len(attr_list)]
+                target_labels = lbl.clone()
+                target_labels[:, attr_idx] = 1 - target_labels[:, attr_idx]
+                target_class = target_labels[0, attr_idx].item()
+                cache_key = self._make_cache_key(name, attr_idx, target_class)
 
-                base_name = img_name if img_name else f'sample_{vis_count:03d}'
-                sanitized = base_name.replace('/', '_')
-                fig.savefig(
-                    inference_dir / f'epoch_{epoch:03d}_{sanitized}_{vis_count:03d}.png',
-                    dpi=150,
-                    bbox_inches='tight'
+                # Saliency + masks
+                ig_map, mask_levels, cam_soft = self._compute_saliency_for_sample(
+                    img.detach(), attr_idx, target_class, cache_key=cache_key
                 )
-                self.writer.add_figure(
-                    f'Validation/sample_{vis_count}',
-                    fig,
-                    epoch
-                )
+                ig_batch = ig_map.unsqueeze(0)
+                masks = [m.unsqueeze(0) for m in mask_levels]
+
+                with torch.no_grad():
+                    probs = torch.sigmoid(self.model.classifier(img))
+                    x_cf, _, _ = self.model(
+                        img, ig_batch, masks, target_labels, probs, attr_idx, hard=True
+                    )
+
+                # To numpy
+                def to_np(x):
+                    x = x.detach().cpu().clamp(0, 1)
+                    return x[0].permute(1, 2, 0).numpy()
+
+                orig_np = to_np((img + 1) * 0.5)  # nếu training ở [-1,1]; điều chỉnh nếu 0-1
+                cf_np = to_np((x_cf + 1) * 0.5)
+
+                # Create overlay
+                def _create_overlay(base_img, saliency_map, alpha=0.4):
+                    """Create overlay image with saliency heatmap."""
+                    heatmap = cv2.applyColorMap(
+                        (saliency_map.detach().cpu().numpy() * 255).astype(np.uint8),
+                        cv2.COLORMAP_JET
+                    )
+                    heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB) / 255.0
+                    overlay = alpha * heatmap + (1 - alpha) * base_img
+                    return np.clip(overlay, 0, 1)
+
+                overlay_np = _create_overlay(orig_np, cam_soft)
+
+                fig, axes = plt.subplots(1, 3, figsize=(9, 3))
+                axes[0].imshow(orig_np)
+                axes[0].set_title("Original")
+                axes[0].axis("off")
+
+                axes[1].imshow(overlay_np)
+                axes[1].set_title(f"Saliency Overlay ({self.attr_names[attr_idx]})")
+                axes[1].axis("off")
+
+                axes[2].imshow(cf_np)
+                axes[2].set_title(f"CE (flip {self.attr_names[attr_idx]})")
+                axes[2].axis("off")
+
+                fig.suptitle(f"Epoch {epoch} • {sanitized}", fontsize=10)
+                fig.tight_layout()
+
+                out_path = inference_dir / f"epoch_{epoch:03d}_{sanitized}.png"
+                fig.savefig(out_path, dpi=120, bbox_inches="tight")
+                self.writer.add_figure(f"ValSimple/{sanitized}", fig, epoch)
                 plt.close(fig)
-                vis_count += 1
 
-        self.model.mutator.train()
-        print(f"🖼️ Validation samples logged: {vis_count}")
+                # Lưu ảnh gốc và cf riêng
+                orig_save_path = inference_dir / f"orig_epoch_{epoch:03d}_sample_{logged:03d}.png"
+                cf_save_path = inference_dir / f"cf_epoch_{epoch:03d}_sample_{logged:03d}.png"
+                plt.imsave(orig_save_path, orig_np)
+                plt.imsave(cf_save_path, cf_np)
+
+                logged += 1
+
+            self.model.mutator.train()
+            print(f"🖼️ Simple validation samples logged: {logged}")
+
+    # def validate_and_visualize(self, epoch, loader, num_samples=4):
+    #     """Generate visualizations during validation"""
+    #     self.model.mutator.eval()
+
+    #     print(f"\n🎨 Generating visualizations for epoch {epoch}...")
+
+    #     inference_dir = self.vis_dir / "validation"
+    #     inference_dir.mkdir(exist_ok=True)
+
+    #     vis_count = 0
+    #     for batch in loader:
+    #         if vis_count >= num_samples:
+    #             break
+
+    #         if isinstance(batch, (list, tuple)) and len(batch) == 3:
+    #             images, labels, filenames = batch
+    #         else:
+    #             images, labels = batch
+    #             filenames = None
+
+    #         images = images.to(self.device)
+    #         labels = labels.to(self.device)
+
+    #         batch_size = images.size(0)
+    #         for sample_idx in range(batch_size):
+    #             if vis_count >= num_samples:
+    #                 break
+
+    #             img = images[sample_idx:sample_idx + 1]
+    #             lbl = labels[sample_idx:sample_idx + 1]
+    #             img_name = None
+    #             if filenames is not None:
+    #                 try:
+    #                     img_name = filenames[sample_idx]
+    #                 except Exception:
+    #                     img_name = None
+                
+    #             with torch.enable_grad():
+    #                 cf_results = self._generate_counterfactuals(img, lbl, num_cf=3, filename=img_name)
+    #             fig = self.visualizer.create_comparison_grid(
+    #                 img.cpu(),
+    #                 cf_results,
+    #                 lbl.cpu(),
+    #                 self.attr_names,
+    #                 active_indices=self.active_attr_indices,
+    #                 active_names=self.active_attr_names,
+    #                 image_name=img_name
+    #             )
+
+    #             base_name = img_name if img_name else f'sample_{vis_count:03d}'
+    #             sanitized = base_name.replace('/', '_')
+    #             fig.savefig(
+    #                 inference_dir / f'epoch_{epoch:03d}_{sanitized}_{vis_count:03d}.png',
+    #                 dpi=150,
+    #                 bbox_inches='tight'
+    #             )
+    #             self.writer.add_figure(
+    #                 f'Validation/sample_{vis_count}',
+    #                 fig,
+    #                 epoch
+    #             )
+    #             plt.close(fig)
+    #             vis_count += 1
+
+    #     self.model.mutator.train()
+    #     print(f"🖼️ Validation samples logged: {vis_count}")
 
     def _generate_counterfactuals(self, img, labels, num_cf=3, filename=None):
         results = {'original': img.detach().cpu(), 'cfs': []}
@@ -883,6 +1014,7 @@ class ComprehensiveTrainer:
         """Save model checkpoint"""
         checkpoint = {
             'epoch': epoch,
+            'decoder_state': self.model.decoder.state_dict(),
             'mutator_state': self.model.mutator.state_dict(),
             'discriminator_state': self.discriminator.state_dict(),
             'optimizer_state': self.optimizer.state_dict(),

@@ -243,7 +243,9 @@ def get_loader(cfg, split='train', batch_size=None, num_workers=None, shuffle=No
         shuffle=shuffle,
         num_workers=num_workers,
         pin_memory=True,
-        drop_last=(split == 'train')
+        drop_last=(split == 'train'),
+        persistent_workers=True if num_workers > 0 else False,
+        prefetch_factor=2 if num_workers > 0 else 0
     )
     
     return loader

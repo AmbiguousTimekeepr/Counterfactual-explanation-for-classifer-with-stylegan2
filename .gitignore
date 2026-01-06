@@ -1,5 +1,8 @@
 # Exclude all checkpoint files
 outputs/**/*.pth
+outputs/cnn_classfier/best_resnet18_cbam_model.pth
+outputs/checkpoints/*_best.pth
+src/imported/classifier_weights/*.pth
 # But keep the best model
 
 # Exclude visualize images
@@ -16,7 +19,8 @@ find_image.py
 
 #Exclude checpoints_production folder
 outputs/checkpoints_production/*
-
+outputs/checkpoints_production/logs/training_log.txt
+outputs/checkpoints_production/metrics_and_visualisations/metrics_history.csv
 #Exclude all script in the .gitignore current folder
 *.py
 *.png

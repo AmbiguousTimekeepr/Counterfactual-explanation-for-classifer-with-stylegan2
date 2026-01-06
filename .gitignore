@@ -26,3 +26,4 @@ outputs/checkpoints_production/metrics_and_visualisations/metrics_history.csv
 *.png
 test.ipynb
 running_script copy.ipynb
+classifier_resnet18_cbam.ipynb

@@ -97,7 +97,7 @@ class CodebookAnalyzer:
         """
         for level, indices in enumerate(indices_list):
             if indices is not None:
-                # ✅ FIX: Move indices to CPU before processing
+                # Move indices to CPU before processing
                 indices_cpu = indices.cpu()
                 # Flatten indices and count usage
                 flat_indices = indices_cpu.view(-1)

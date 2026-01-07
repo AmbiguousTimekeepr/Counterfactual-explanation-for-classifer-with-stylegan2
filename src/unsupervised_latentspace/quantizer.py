@@ -26,7 +26,7 @@ class VectorQuantizerEMA(nn.Module):
         input_shape = inputs.shape
         flat_input = inputs.view(-1, self.embedding_dim)
         
-        # ✅ FIX 1: Force float32 for distance calculation (prevent overflow in AMP)
+        # Force float32 for distance calculation (prevent overflow in AMP)
         flat_input_fp32 = flat_input.float()
         embedding_fp32 = self.embedding.float()
         
@@ -69,6 +69,6 @@ class VectorQuantizerEMA(nn.Module):
         quantized = inputs + (quantized - inputs).detach()
         quantized = quantized.permute(0, 3, 1, 2).contiguous()
         
-        # ✅ Return one-hot encodings [B*H*W, num_embeddings] for perplexity calculation
+        # Return one-hot encodings [B*H*W, num_embeddings] for perplexity calculation
         # This avoids conversion overhead in trainer.py
         return quantized, loss, encodings

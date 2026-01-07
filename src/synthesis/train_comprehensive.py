@@ -1,6 +1,6 @@
 import torch
 import torch.optim as optim
-from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import autocast
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
@@ -115,7 +115,7 @@ class ComprehensiveTrainer:
         self.vis_dir = self.exp_dir / "visualizations"
         self.vis_dir.mkdir(exist_ok=True)
         
-        print(f"📁 Experiment directory: {self.exp_dir}")
+        print(f"Experiment directory: {self.exp_dir}")
     
     def init_models(self):
         """Initialize all models"""
@@ -152,24 +152,44 @@ class ComprehensiveTrainer:
         self.adv_weight = getattr(self.cfg, 'adv_weight', 0.5)
         print(f"Adversarial loss weight: {self.adv_weight}")
         
-        self.scaler = GradScaler()
+        try:
+            # Prefer newer torch.amp API when available
+            self.scaler = torch.amp.GradScaler("cuda", enabled=torch.cuda.is_available())
+        except TypeError:
+            # Backward compatibility for older torch versions
+            self.scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
         self.decoder_pretrained = False
-
+        sharpened_path = getattr(self.cfg, 'sharpened_decoder_path', '')
         decoder_ckpt_path = getattr(self.cfg, 'decoder_checkpoint_path', '')
-        if decoder_ckpt_path:
+
+        chosen_path = None
+        chosen_label = None
+
+        if sharpened_path:
+            sharp_path = Path(sharpened_path)
+            if sharp_path.is_file():
+                chosen_path = sharp_path
+                chosen_label = "sharpened decoder checkpoint"
+            else:
+                print(f"Sharpened decoder checkpoint not found at {sharp_path}")
+
+        if chosen_path is None and decoder_ckpt_path:
             ckpt_path = Path(decoder_ckpt_path)
             if ckpt_path.is_file():
-                self.model.load_decoder_checkpoint(ckpt_path, map_location=self.device)
-                self.decoder_pretrained = True
-                print(f"🧭 Loaded decoder weights from {ckpt_path}")
+                chosen_path = ckpt_path
+                chosen_label = "decoder checkpoint"
             else:
-                if getattr(self.cfg, 'decoder_pretrain_epochs', 0) > 0:
-                    print(f"ℹ️ Decoder checkpoint not found at {ckpt_path}; will train the decoder from scratch.")
-                else:
-                    print(f"⚠️ Decoder checkpoint not found at {ckpt_path}; starting with random weights.")
+                print(f"Decoder checkpoint not found at {ckpt_path}")
+
+        if chosen_path is not None:
+            self.model.load_decoder_checkpoint(chosen_path, map_location=self.device)
+            self.decoder_pretrained = True
+            print(f"Loaded decoder weights from {chosen_path} ({chosen_label})")
         else:
             if getattr(self.cfg, 'decoder_pretrain_epochs', 0) > 0:
-                print("ℹ️ No decoder checkpoint supplied; decoder will be trained from scratch.")
+                print("No decoder checkpoint supplied; decoder will be trained from scratch.")
+            else:
+                print("No decoder checkpoint supplied; starting with random decoder weights.")
     
     def _initialize_active_attributes(self):
         """Derive active attribute indices based on configuration."""
@@ -183,7 +203,7 @@ class ComprehensiveTrainer:
             self.active_attr_names = list(self.attr_names)
 
         self.active_attr_indices = [self.attr_names.index(name) for name in self.active_attr_names]
-        print(f"🎯 Active synthesis attributes ({len(self.active_attr_indices)}): {', '.join(self.active_attr_names)}")
+        print(f"Active synthesis attributes ({len(self.active_attr_indices)}): {', '.join(self.active_attr_names)}")
 
     def setup_logging(self):
         """Setup Tensorboard and CSV logging"""
@@ -498,7 +518,7 @@ class ComprehensiveTrainer:
                     axes[3].set_title("Counterfactual")
                     axes[3].axis('off')
 
-                    fig.suptitle(f"{base_name} — {attr_name}", fontsize=12)
+                    fig.suptitle(f"{base_name} - {attr_name}", fontsize=12)
                     fig.tight_layout(rect=[0, 0, 1, 0.95])
 
                     output_path = epoch_dir / f"{base_name}_{attr_name}.png"
@@ -818,13 +838,9 @@ class ComprehensiveTrainer:
                 lbl = labels[i:i+1]
                 name = filenames[i] if filenames is not None else f"sample_{logged:03d}"
                 sanitized = self._sanitize_filename(str(name))
-#                            self.attr_names.index('Brown_Hair')
-#                            self.attr_names.index('Mouth_Slightly_Open'),
-#                            self.attr_names.index('Eyeglasses')
-                # Chọn attr ngẫu nhiên như trong _generate_counterfactuals
-                # attr_idx = random.choice(self.active_attr_indices)
-                attr_list = [self.attr_names.index('Mustache'),
-                ]
+                attr_list = [self.attr_names.index(attr_name) for attr_name in self.active_attr_names]
+                # attr_list = [self.attr_names.index('Mustache'),
+                # ]
                 attr_idx = attr_list[logged % len(attr_list)]
                 target_labels = lbl.clone()
                 target_labels[:, attr_idx] = 1 - target_labels[:, attr_idx]
@@ -878,7 +894,7 @@ class ComprehensiveTrainer:
                 axes[2].set_title(f"CE (flip {self.attr_names[attr_idx]})")
                 axes[2].axis("off")
 
-                fig.suptitle(f"Epoch {epoch} • {sanitized}", fontsize=10)
+                fig.suptitle(f"Epoch {epoch} - {sanitized}", fontsize=10)
                 fig.tight_layout()
 
                 out_path = inference_dir / f"epoch_{epoch:03d}_{sanitized}.png"
@@ -895,74 +911,7 @@ class ComprehensiveTrainer:
                 logged += 1
 
             self.model.mutator.train()
-            print(f"🖼️ Simple validation samples logged: {logged}")
-
-    # def validate_and_visualize(self, epoch, loader, num_samples=4):
-    #     """Generate visualizations during validation"""
-    #     self.model.mutator.eval()
-
-    #     print(f"\n🎨 Generating visualizations for epoch {epoch}...")
-
-    #     inference_dir = self.vis_dir / "validation"
-    #     inference_dir.mkdir(exist_ok=True)
-
-    #     vis_count = 0
-    #     for batch in loader:
-    #         if vis_count >= num_samples:
-    #             break
-
-    #         if isinstance(batch, (list, tuple)) and len(batch) == 3:
-    #             images, labels, filenames = batch
-    #         else:
-    #             images, labels = batch
-    #             filenames = None
-
-    #         images = images.to(self.device)
-    #         labels = labels.to(self.device)
-
-    #         batch_size = images.size(0)
-    #         for sample_idx in range(batch_size):
-    #             if vis_count >= num_samples:
-    #                 break
-
-    #             img = images[sample_idx:sample_idx + 1]
-    #             lbl = labels[sample_idx:sample_idx + 1]
-    #             img_name = None
-    #             if filenames is not None:
-    #                 try:
-    #                     img_name = filenames[sample_idx]
-    #                 except Exception:
-    #                     img_name = None
-                
-    #             with torch.enable_grad():
-    #                 cf_results = self._generate_counterfactuals(img, lbl, num_cf=3, filename=img_name)
-    #             fig = self.visualizer.create_comparison_grid(
-    #                 img.cpu(),
-    #                 cf_results,
-    #                 lbl.cpu(),
-    #                 self.attr_names,
-    #                 active_indices=self.active_attr_indices,
-    #                 active_names=self.active_attr_names,
-    #                 image_name=img_name
-    #             )
-
-    #             base_name = img_name if img_name else f'sample_{vis_count:03d}'
-    #             sanitized = base_name.replace('/', '_')
-    #             fig.savefig(
-    #                 inference_dir / f'epoch_{epoch:03d}_{sanitized}_{vis_count:03d}.png',
-    #                 dpi=150,
-    #                 bbox_inches='tight'
-    #             )
-    #             self.writer.add_figure(
-    #                 f'Validation/sample_{vis_count}',
-    #                 fig,
-    #                 epoch
-    #             )
-    #             plt.close(fig)
-    #             vis_count += 1
-
-    #     self.model.mutator.train()
-    #     print(f"🖼️ Validation samples logged: {vis_count}")
+            print(f"Simple validation samples logged: {logged}")
 
     def _generate_counterfactuals(self, img, labels, num_cf=3, filename=None):
         results = {'original': img.detach().cpu(), 'cfs': []}
@@ -1030,13 +979,13 @@ class ComprehensiveTrainer:
         if is_best:
             best_path = self.checkpoint_dir / 'best.pth'
             torch.save(checkpoint, best_path)
-            print(f"✨ Best checkpoint saved: {best_path}")
+            print(f"Best checkpoint saved: {best_path}")
     
     def recon_training(self, loader):
         """Pre-train the decoder with reconstruction loss"""
         decoder_epochs = getattr(self.cfg, 'decoder_pretrain_epochs', 0)
         if decoder_epochs <= 0:
-            print("ℹ️ decoder_pretrain_epochs <= 0 — skipping decoder pre-training.")
+            print("decoder_pretrain_epochs <= 0 - skipping decoder pre-training.")
             return
 
         decoder_lr = getattr(self.cfg, 'decoder_lr', 1e-3)
@@ -1050,10 +999,13 @@ class ComprehensiveTrainer:
 
         preview_imgs_cpu = next(iter(loader))[0][:4].clone()
 
-        print(f"🎯 Starting StyleGAN decoder pre-training for {decoder_epochs} epoch(s)")
+        print(f"Starting StyleGAN decoder pre-training for {decoder_epochs} epoch(s)")
         self.model.decoder.train()
         optimizer = optim.Adam(self.model.decoder.parameters(), lr=decoder_lr, betas=decoder_betas)
-        scaler = GradScaler()
+        try:
+            scaler = torch.amp.GradScaler("cuda", enabled=torch.cuda.is_available())
+        except TypeError:
+            scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
         l1_loss = torch.nn.L1Loss()
         lpips_loss = self.loss_manager.lpips
 
@@ -1084,7 +1036,7 @@ class ComprehensiveTrainer:
 
                 pbar.set_postfix({'L1': loss_l1.item(), 'LPIPS': loss_lpips.item()})
 
-            print("🖼️ Generating reconstruction preview...")
+            print("Generating reconstruction preview...")
             self.model.decoder.eval()
             with torch.no_grad():
                 preview = preview_imgs_cpu.to(self.device)
@@ -1109,25 +1061,25 @@ class ComprehensiveTrainer:
             preview_path = preview_dir / f"epoch_{epoch:03d}.png"
             fig.savefig(preview_path, dpi=150, bbox_inches='tight')
             plt.close(fig)
-            print(f"🖼️ Saved decoder preview: {preview_path}")
+            print(f"Saved decoder preview: {preview_path}")
             self.model.decoder.train()
 
             if epoch % 5 == 0:
                 torch.save(self.model.decoder.state_dict(), primary_ckpt)
                 torch.save(self.model.decoder.state_dict(), latest_ckpt)
-                print(f"💾 Saved decoder checkpoints to {primary_ckpt} and {latest_ckpt}")
+                print(f"Saved decoder checkpoints to {primary_ckpt} and {latest_ckpt}")
 
         self.model.decoder.eval()
         self.decoder_pretrained = True
         self.cfg.decoder_checkpoint_path = str(latest_ckpt)
-        print("✅ Decoder pre-training complete")
+        print("Decoder pre-training complete")
 
     def train(self, num_epochs, loader_train, loader_val=None, loader_test=None):
         """Full training loop"""
-        print("🚀 Starting Comprehensive Counterfactual Training...")
-        print(f"📊 Logging to: {self.log_dir}")
-        print(f"💾 Checkpoints to: {self.checkpoint_dir}")
-        print(f"🎨 Visualizations to: {self.vis_dir}")
+        print("Starting Comprehensive Counterfactual Training...")
+        print(f"Logging to: {self.log_dir}")
+        print(f"Checkpoints to: {self.checkpoint_dir}")
+        print(f"Visualizations to: {self.vis_dir}")
 
         for epoch in range(num_epochs):
             epoch_losses = self.train_epoch(epoch, loader_train)
@@ -1149,7 +1101,7 @@ class ComprehensiveTrainer:
                     new_lr = schedule[epoch]
                     for param_group in self.optimizer.param_groups:
                         param_group['lr'] = new_lr
-                    print(f"📉 Learning rate updated to {new_lr}")
+                    print(f"Learning rate updated to {new_lr}")
 
 
 def main():

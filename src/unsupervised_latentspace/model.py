@@ -77,7 +77,7 @@ class HVQVAE_3Level(nn.Module):
             nn.Tanh()
         )
         
-        # ✅ FIX: Initialize weights properly
+        # Initialize weights properly
         self._init_weights()
     
     def _init_weights(self):
@@ -96,7 +96,7 @@ class HVQVAE_3Level(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def forward(self, x, dropout_rate=0.0):
-        # ✅ FIX: Clamp input to [-1, 1]
+        # Clamp input to [-1, 1]
         x = torch.clamp(x, -1.0, 1.0)
         
         # 1. Encode
@@ -109,7 +109,7 @@ class HVQVAE_3Level(nn.Module):
         q_m, loss_m, ids_m = self.quant_m(self.quant_conv_m(feat_m))
         q_b, loss_b, ids_b = self.quant_b(self.quant_conv_b(feat_b))
         
-        # ✅ NEW: CASCADED DROPOUT LOGIC (Enforce Hierarchy)
+        # Cascaded dropout logic (enforce hierarchy)
         # Implements 25-25-50 split to force semantic hierarchy learning
         if self.training and dropout_rate > 0.0:
             r = torch.rand(1).item()
@@ -127,7 +127,7 @@ class HVQVAE_3Level(nn.Module):
             else:
                 pass
         
-        # ✅ FIX: Clamp quantized values to prevent NaN
+        # Clamp quantized values to prevent NaN
         q_t = torch.clamp(q_t, -10.0, 10.0)
         q_m = torch.clamp(q_m, -10.0, 10.0)
         q_b = torch.clamp(q_b, -10.0, 10.0)
@@ -135,7 +135,7 @@ class HVQVAE_3Level(nn.Module):
         # 3. Decode (Pass NATIVE resolutions)
         recon = self.decode_codes(q_t, q_m, q_b)
         
-        # ✅ FIX: Ensure output is in [-1, 1]
+        # Ensure output is in [-1, 1]
         recon = torch.clamp(recon, -1.0, 1.0)
         
         return recon, loss_t + loss_m + loss_b, (ids_t, ids_m, ids_b)

@@ -13,7 +13,7 @@ class VGGPerceptualLoss(nn.Module):
         self.layer = layer
         self.device = device
         
-        # ✅ FIX: Lazy import to avoid circular dependency
+        # Lazy import to avoid circular dependency
         from torchvision import models
         
         # Load pretrained VGG16

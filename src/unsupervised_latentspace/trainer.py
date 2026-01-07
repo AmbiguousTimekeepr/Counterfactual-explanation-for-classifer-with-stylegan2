@@ -9,8 +9,6 @@ from .model import HVQVAE_3Level
 from .discriminator import NLayerDiscriminator
 from .losses import calculate_loss, VGGPerceptualLoss
 from .dataset import get_loader
-from torchvision.utils import save_image, make_grid
-import math
 from collections import deque
 from datetime import datetime
 import matplotlib.pyplot as plt
@@ -52,7 +50,7 @@ class LossTracker:
         return {k: self.get_avg(k) for k in self.losses}
 
 def calculate_perplexity(encodings, num_embeddings):
-    """✅ Calculate perplexity metric for VQ codebook usage
+    """Calculate perplexity metric for VQ codebook usage
     
     Perplexity measures how many codebook entries are being actively used.
     Higher perplexity = better utilization of the codebook.
@@ -85,7 +83,7 @@ def calculate_perplexity(encodings, num_embeddings):
         raise ValueError(f"Perplexity calculation failed: {e}")
 
 def sample_and_save(model, original_imgs, num_samples, save_path, device):
-    """✅ FIXED: Generate and save progressive decoding without upsampling codes
+    """Generate and save progressive decoding without upsampling codes
     
     Strategy: Pass codes at NATIVE resolutions to decoder
     - q_t: 8x8    -> dec_t (stride=2) -> 16x16
@@ -110,7 +108,7 @@ def sample_and_save(model, original_imgs, num_samples, save_path, device):
             q_b, _, _ = model.quant_b(model.quant_conv_b(feat_b))  # 32x32
             
             # 3. Progressive decoding (pass native resolutions directly)
-            
+
             # Stage 1: Only q_t (top level - coarsest)
             z_m = torch.zeros_like(q_m)
             z_b = torch.zeros_like(q_b)
@@ -122,11 +120,11 @@ def sample_and_save(model, original_imgs, num_samples, save_path, device):
             # Stage 3: All levels (q_t + q_m + q_b - finest)
             stage_3 = model.decode_codes(q_t, q_m, q_b)
         
-        # ✅ Verify batch sizes match
+        # Verify batch sizes match
         assert original_imgs_subset.shape[0] == stage_1.shape[0] == stage_2.shape[0] == stage_3.shape[0], \
             f"Batch mismatch: orig={original_imgs_subset.shape[0]}, s1={stage_1.shape[0]}, s2={stage_2.shape[0]}, s3={stage_3.shape[0]}"
         
-        # ✅ Create progressive visualization grid
+        # Create progressive visualization grid
         rows = []
         for i in range(actual_num_samples):
             row = torch.stack([
@@ -141,7 +139,7 @@ def sample_and_save(model, original_imgs, num_samples, save_path, device):
         # grid_img = make_grid(grid_tensor, nrow=4, normalize=True, value_range=(-1, 1), padding=2, pad_value=0.5)
         # save_image(grid_img, save_path)
         
-        # ✅ Save detailed comparison plot
+        # Save detailed comparison plot
         save_comparison_plot(
             original_imgs_subset, stage_1, stage_2, stage_3,
             save_path.replace('.png', '_comparison.png'),
@@ -149,12 +147,12 @@ def sample_and_save(model, original_imgs, num_samples, save_path, device):
         )
         
     except Exception as e:
-        print(f"⚠️  Could not save samples: {e}. Skipping sample save.")
+        print(f"Warning: Could not save samples: {e}. Skipping sample save.")
     
     model.train()
 
 def save_comparison_plot(original, stage1, stage2, stage3, save_path, num_samples=8):
-    """✅ NEW: Create detailed matplotlib comparison visualization"""
+    """Create detailed matplotlib comparison visualization"""
     try:
         # Ensure all tensors are on CPU and have matching batch sizes
         original = original.cpu()
@@ -217,14 +215,14 @@ def save_comparison_plot(original, stage1, stage2, stage3, save_path, num_sample
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.close()
     except Exception as e:
-        print(f"⚠️  Could not save comparison plot: {e}")
+        print(f"Warning: Could not save comparison plot: {e}")
 
 def train():
     # 1. Setup - Create directory structure
     if not os.path.exists(cfg.save_dir):
         os.makedirs(cfg.save_dir)
     
-    # ✅ NEW: Create checkpoints subfolder
+    # Create checkpoints subfolder
     checkpoints_dir = os.path.join(cfg.save_dir, "checkpoints")
     samples_dir = os.path.join(cfg.save_dir, "samples")
     logs_dir = os.path.join(cfg.save_dir, "logs")
@@ -240,7 +238,7 @@ def train():
             f.write("step,loss_g,adv_g,disc_d,recon,vq,perc,perplexity\n")
         
     print("="*70)
-    print("🔧 HVQ-GAN TRAINING V3 (Step-based, Unsupervised)")
+    print("HVQ-GAN TRAINING V3 (Step-based, Unsupervised)")
     print("="*70)
     print(f"Device: {cfg.device}")
     print(f"Total Steps: {cfg.total_steps:,}")
@@ -249,11 +247,11 @@ def train():
     print(f"Save Interval: {cfg.save_interval:,} steps")
     print(f"Sample Interval: {cfg.sample_interval:,} steps")
     print("="*70)
-    print(f"📁 Output Directory: {cfg.save_dir}")
-    print(f"   ├── checkpoints/              (model checkpoints)")
-    print(f"   ├── samples/                  (progressive decoding visualizations)")
-    print(f"   ├── metrics_and_visualisations/ (training metrics & analysis)")
-    print(f"   └── logs/                     (training logs)")
+    print(f"Output Directory: {cfg.save_dir}")
+    print(f"   |- checkpoints/              (model checkpoints)")
+    print(f"   |- samples/                  (progressive decoding visualizations)")
+    print(f"   |- metrics_and_visualisations/ (training metrics & analysis)")
+    print(f"   '- logs/                     (training logs)")
     print("="*70 + "\n")
     
     # 2. Model & Optimizers
@@ -269,7 +267,7 @@ def train():
     # 3. Perceptual Loss
     print("Loading VGG for Perceptual Loss...")
     perceptual_fn = VGGPerceptualLoss().to(cfg.device).eval()
-    print("✅ VGG loaded\n")
+    print("VGG loaded\n")
     
     # 4. Data
     dataloader = get_loader(cfg)
@@ -279,7 +277,7 @@ def train():
     # 5. Loss tracker
     loss_tracker = LossTracker(window_size=cfg.log_interval)
     
-    # ✅ NEW: Initialize metrics and visualization
+    # Initialize metrics and visualization
     metrics_calc = MetricsCalculator(device=cfg.device)
     codebook_analyzer = CodebookAnalyzer(num_embeddings=cfg.num_embeddings, num_levels=3)
     
@@ -302,22 +300,22 @@ def train():
             
             images = images.to(cfg.device)
             
-            # ✅ SAFETY: Check input
+            # Safety: Check input
             if torch.isnan(images).any() or torch.isinf(images).any():
-                print(f"\n❌ Step {step}: NaN/Inf in input batch!")
+                print(f"\nStep {step}: NaN/Inf in input batch!")
                 continue
             
             # ========== GENERATOR UPDATE ==========
             optimizer_g.zero_grad()
             
             with autocast(enabled=cfg.use_amp):
-                # ✅ NEW: Enable cascaded dropout (25-25-50 split)
+                # Enable cascaded dropout (25-25-50 split)
                 # dropout_rate=1.0 activates the cascaded dropout logic in model
                 recon, vq_loss, encodings = model(images, dropout_rate=1.0)
                 
-                # ✅ SAFETY: Check recon
+                # Safety: Check recon
                 if torch.isnan(recon).any() or torch.isinf(recon).any():
-                    print(f"\n❌ Step {step}: NaN/Inf in reconstruction!")
+                    print(f"\nStep {step}: NaN/Inf in reconstruction!")
                     nan_steps += 1
                     if nan_steps > max_nan_tolerance:
                         raise RuntimeError(f"Too many NaN steps ({nan_steps}). Training unstable.")
@@ -327,15 +325,15 @@ def train():
                     recon, images, vq_loss, cfg.weights, perceptual_fn
                 )
                 
-                # ✅ SAFETY: Check losses
+                # Safety: Check losses
                 if torch.isnan(loss_vae) or torch.isinf(loss_vae):
-                    print(f"\n❌ Step {step}: NaN/Inf in VAE loss!")
+                    print(f"\nStep {step}: NaN/Inf in VAE loss!")
                     nan_steps += 1
                     if nan_steps > max_nan_tolerance:
                         raise RuntimeError(f"Too many NaN steps ({nan_steps}). Training unstable.")
                     continue
                 
-                # ✅ Calculate perplexity from VQ encodings
+                # Calculate perplexity from VQ encodings
                 perplexity_val = 0.0
                 if encodings is not None:
                     try:
@@ -356,7 +354,7 @@ def train():
                                 encodings_flat = encodings
                             perplexity_val = calculate_perplexity(encodings_flat, encodings_flat.size(-1))
                     except Exception as e:
-                        print(f"⚠️  Warning: Could not calculate perplexity at step {step}: {e}")
+                        print(f"Warning: Could not calculate perplexity at step {step}: {e}")
                         perplexity_val = 0.0
                 
                 disc_active = step >= cfg.disc_start_step
@@ -385,7 +383,7 @@ def train():
                     loss_d_val = F.softplus(-disc_real).mean() + F.softplus(disc_fake).mean()
                 
                 if torch.isnan(loss_d_val) or torch.isinf(loss_d_val):
-                    print(f"\n❌ Step {step}: NaN/Inf in discriminator loss!")
+                    print(f"\nStep {step}: NaN/Inf in discriminator loss!")
                     nan_steps += 1
                     if nan_steps > max_nan_tolerance:
                         raise RuntimeError(f"Too many NaN steps ({nan_steps}). Training unstable.")
@@ -449,7 +447,7 @@ def train():
                 sample_path = os.path.join(samples_dir, f"progressive_step_{step}.png")
                 sample_and_save(model, images, cfg.num_samples, sample_path, cfg.device)
             
-            # ✅ NEW: Save checkpoint + metrics + visualizations every N steps
+            # Save checkpoint + metrics + visualizations every N steps
             if step % cfg.save_interval == 0 and step > 0:
                 # 1. Save checkpoint (existing logic)
                 checkpoint = {
@@ -466,12 +464,12 @@ def train():
                 latest_path = os.path.join(checkpoints_dir, "model_latest.pth")
                 torch.save(model.state_dict(), latest_path)
                 
-                # ✅ NEW: Compute and save metrics
+                # Compute and save metrics
                 with torch.no_grad():
                     sample_metrics = metrics_calc.compute_metrics(images, recon, step)
                     codebook_analyzer.update(encodings)
                 
-                # ✅ NEW: Generate progressive stages for visualization
+                # Generate progressive stages for visualization
                 with torch.no_grad():
                     model.eval()
                     feat_b = model.enc_b(images[:4])
@@ -488,7 +486,7 @@ def train():
                     stage_3 = model.decode_codes(q_t, q_m, q_b)
                     model.train()
                 
-                # ✅ NEW: Create comprehensive evaluation report (saved to metrics_and_visualisations)
+                # Create comprehensive evaluation report (saved to metrics_and_visualisations)
                 try:
                     create_evaluation_report(
                         loss_tracker, 
@@ -502,17 +500,17 @@ def train():
                         step
                     )
                 except Exception as e:
-                    print(f"⚠️  Could not create evaluation report: {e}")
+                    print(f"Warning: Could not create evaluation report: {e}")
                 
-                # ✅ NEW: Save metrics history (to metrics_and_visualisations)
+                # Save metrics history (to metrics_and_visualisations)
                 try:
                     metrics_path = metrics_calc.save_metrics(metrics_viz_dir)
                     print(f"   Metrics history: {os.path.basename(metrics_path)}")
                 except Exception as e:
-                    print(f"⚠️  Could not save metrics: {e}")
+                    print(f"Warning: Could not save metrics: {e}")
                 
                 # Print summary
-                print(f"\n✅ Step {step:,} Checkpoint:")
+                print(f"\nStep {step:,} Checkpoint:")
                 print(f"   Checkpoint: {os.path.basename(ckpt_path)}")
                 print(f"   Metrics: MSE={sample_metrics['mse']:.4f}, PSNR={sample_metrics['psnr']:.2f} dB, SSIM={sample_metrics['ssim']:.3f}")
                 codebook_metrics = codebook_analyzer.get_diversity_metrics()
@@ -522,29 +520,29 @@ def train():
                           f"Bottom usage={codebook_metrics.get('Bottom_usage_ratio', 0):.1%}")
     
     print("\n" + "="*70)
-    print("✅ HVQ-GAN TRAINING COMPLETED SUCCESSFULLY!")
+    print("HVQ-GAN training completed.")
     print("="*70)
-    print(f"\n📁 Output Structure:")
+    print(f"\nOutput Structure:")
     print(f"   {cfg.save_dir}/")
-    print(f"   ├── checkpoints/")
-    print(f"   │   ├── checkpoint_step_5000.pth")
-    print(f"   │   ├── checkpoint_step_10000.pth")
-    print(f"   │   └── model_latest.pth")
-    print(f"   ├── samples/")
-    print(f"   │   ├── progressive_step_2500_comparison.png")
-    print(f"   │   ├── progressive_step_5000_comparison.png")
-    print(f"   │   └── progressive_step_10000_comparison.png")
-    print(f"   ├── metrics_and_visualisations/")
-    print(f"   │   ├── loss_curves_step_5000.png")
-    print(f"   │   ├── metrics_comparison_step_5000.png")
-    print(f"   │   ├── cascade_hierarchy_step_5000.png")
-    print(f"   │   ├── codebook_usage_step_5000.png")
-    print(f"   │   ├── codebook_analysis_step_5000.txt")
-    print(f"   │   └── metrics_history.csv")
-    print(f"   └── logs/")
-    print(f"       └── training_log.txt")
-    print(f"\n📊 Final step: {step:,}/{cfg.total_steps:,}")
-    print(f"\n💡 Each sample shows 4 stages:")
+    print(f"   |- checkpoints/")
+    print(f"   |  |- checkpoint_step_5000.pth")
+    print(f"   |  |- checkpoint_step_10000.pth")
+    print(f"   |  '- model_latest.pth")
+    print(f"   |- samples/")
+    print(f"   |  |- progressive_step_2500_comparison.png")
+    print(f"   |  |- progressive_step_5000_comparison.png")
+    print(f"   |  '- progressive_step_10000_comparison.png")
+    print(f"   |- metrics_and_visualisations/")
+    print(f"   |  |- loss_curves_step_5000.png")
+    print(f"   |  |- metrics_comparison_step_5000.png")
+    print(f"   |  |- cascade_hierarchy_step_5000.png")
+    print(f"   |  |- codebook_usage_step_5000.png")
+    print(f"   |  |- codebook_analysis_step_5000.txt")
+    print(f"   |  '- metrics_history.csv")
+    print(f"   '- logs/")
+    print(f"      '- training_log.txt")
+    print(f"\nFinal step: {step:,}/{cfg.total_steps:,}")
+    print(f"\nEach sample shows 4 stages:")
     print(f"   1. Original input image")
     print(f"   2. Stage 1 - Top level only (coarsest, 8x8 code)")
     print(f"   3. Stage 2 - Top + Middle (mid-resolution, 16x16 code)")

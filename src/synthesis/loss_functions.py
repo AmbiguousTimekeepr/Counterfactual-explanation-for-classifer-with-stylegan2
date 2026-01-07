@@ -1,9 +1,23 @@
 # synthesis/loss_functions.py
+import warnings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models
+from torchvision.models import VGG16_Weights
 import lpips
+
+# Suppress torchvision's deprecated 'pretrained' warnings triggered by upstream LPIPS
+warnings.filterwarnings(
+    "ignore",
+    category=UserWarning,
+    message="The parameter 'pretrained' is deprecated"
+)
+warnings.filterwarnings(
+    "ignore",
+    category=UserWarning,
+    message="Arguments other than a weight enum or `None` for 'weights' are deprecated"
+)
 
 
 class CounterfactualLossManager(nn.Module):
@@ -15,7 +29,7 @@ class CounterfactualLossManager(nn.Module):
         self.lpips = lpips.LPIPS(net='vgg', spatial=True).to(device).eval()
 
         # ✅ FIXED: Properly slice VGG features using nn.Sequential
-        vgg_full = models.vgg16(pretrained=True).features
+        vgg_full = models.vgg16(weights=VGG16_Weights.IMAGENET1K_V1).features
         # Extract layers 0-15 (first 16 layers) and wrap in Sequential
         vgg_layers = nn.Sequential(*list(vgg_full.children())[:16])
         self.vgg = vgg_layers.to(device).eval()

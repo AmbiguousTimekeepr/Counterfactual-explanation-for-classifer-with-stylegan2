@@ -39,7 +39,7 @@ def viz_traversals(model, dataloader, device, save_dir="traversals", num_samples
             if batch_idx >= 2:
                 break  # Only visualize a few batches for speed
     
-    print(f"  ✅ Generated traversal visualizations at {save_dir}")
+    print(f"  Generated traversal visualizations at {save_dir}")
 
 def viz_usage(model, dataloader, device, save_dir="usage", num_batches=10):
     """Analyze codebook usage across stages"""
@@ -74,7 +74,7 @@ def viz_tsne(model, dataloader, device, save_dir="tsne", num_samples=100):
     try:
         from sklearn.manifold import TSNE
     except ImportError:
-        print("  ⚠️ scikit-learn not installed, skipping t-SNE visualization")
+        print("  Warning: scikit-learn not installed, skipping t-SNE visualization")
         return
     
     os.makedirs(save_dir, exist_ok=True)
@@ -131,14 +131,14 @@ def viz_neighbors(model, dataloader, device, save_dir="neighbors"):
                 recon = model.decode_from_stage(z, stage_idx)
                 reconstructions.append(recon)
             except Exception as e:
-                print(f"    ⚠️ Error at stage {stage_idx}: {e}")
+                print(f"    Warning: error at stage {stage_idx}: {e}")
     
     # Create grid
     if len(reconstructions) > 1:
         from torchvision.utils import make_grid
         grid = make_grid(torch.cat(reconstructions, dim=0), nrow=len(images), normalize=True, value_range=(-1, 1))
         save_image(grid, os.path.join(save_dir, "stage_progression.png"))
-        print(f"  ✅ Generated stage progression visualization at {save_dir}")
+        print(f"  Generated stage progression visualization at {save_dir}")
 
 def viz_error_maps(model, dataloader, device, save_dir="errors", num_batches=5):
     """Visualize reconstruction error across images"""
@@ -154,7 +154,7 @@ def viz_error_maps(model, dataloader, device, save_dir="errors", num_batches=5):
             images = batch[0] if isinstance(batch, (list, tuple)) else batch
             images = images.to(device)
             
-            # ✅ FIX: Handle new 4-return signature
+            # Handle new 4-return signature
             recon, vq_loss, info, indices_list = model(images)
             
             # Compute per-pixel error
@@ -194,7 +194,7 @@ class TrainingVisualizer:
         
         # Get history
         if not hasattr(loss_tracker, 'losses') or len(loss_tracker.losses['total']) == 0:
-            print("⚠️  No loss history available for plotting")
+            print("Warning: no loss history available for plotting")
             return None
         
         steps = range(len(loss_tracker.losses['total']))
@@ -238,7 +238,7 @@ class TrainingVisualizer:
         fig.suptitle(f'Reconstruction Metrics at Step {step:,}', fontsize=16, fontweight='bold')
         
         if 'step' not in metrics_dict or len(metrics_dict['step']) == 0:
-            print("⚠️  No metrics history available for plotting")
+            print("Warning: no metrics history available for plotting")
             return None
         
         steps = metrics_dict['step']
@@ -336,7 +336,7 @@ class TrainingVisualizer:
         metrics = codebook_analyzer.get_diversity_metrics()
         
         if not metrics:
-            print("⚠️  No codebook metrics available")
+            print("Warning: no codebook metrics available")
             return None
         
         fig, axes = plt.subplots(1, 3, figsize=(15, 4))
@@ -378,35 +378,35 @@ def create_evaluation_report(loss_tracker, metrics_dict, codebook_analyzer,
     """Create comprehensive evaluation report"""
     
     print("\n" + "="*70)
-    print(f"📊 CREATING EVALUATION REPORT AT STEP {step:,}")
+    print(f"Creating evaluation report at step {step:,}")
     print("="*70)
     
     visualizer = TrainingVisualizer()
     
-    # ✅ DISABLED: Plot loss curves
+    # Disabled: plot loss curves
     # loss_plot = visualizer.plot_loss_curves(loss_tracker, save_dir, step)
     # if loss_plot:
-    #     print(f"✅ Loss curves saved: {os.path.basename(loss_plot)}")
+    #     print(f"Loss curves saved: {os.path.basename(loss_plot)}")
     
     # Plot metrics
     if metrics_dict:
         metrics_plot = visualizer.plot_metrics_comparison(metrics_dict, save_dir, step)
         if metrics_plot:
-            print(f"✅ Metrics comparison saved: {os.path.basename(metrics_plot)}")
+            print(f"Metrics comparison saved: {os.path.basename(metrics_plot)}")
     
     # Plot cascade hierarchy
     cascade_plot = visualizer.plot_cascade_hierarchy(original, stage_1, stage_2, stage_3, save_dir, step)
     if cascade_plot:
-        print(f"✅ Cascade hierarchy saved: {os.path.basename(cascade_plot)}")
+        print(f"Cascade hierarchy saved: {os.path.basename(cascade_plot)}")
     
-    # ✅ DISABLED: Plot codebook usage
+    # Disabled: plot codebook usage
     # if codebook_analyzer:
     #     codebook_plot = visualizer.plot_codebook_usage(codebook_analyzer, save_dir, step)
     #     if codebook_plot:
-    #         print(f"✅ Codebook usage saved: {os.path.basename(codebook_plot)}")
+    #         print(f"Codebook usage saved: {os.path.basename(codebook_plot)}")
     #     
     #     # Save codebook analysis
     #     analysis_file = codebook_analyzer.save_analysis(save_dir, step)
-    #     print(f"✅ Codebook analysis saved: {os.path.basename(analysis_file)}")
+    #     print(f"Codebook analysis saved: {os.path.basename(analysis_file)}")
     
     print("="*70 + "\n")

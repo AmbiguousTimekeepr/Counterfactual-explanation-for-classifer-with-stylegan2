@@ -79,7 +79,7 @@ class CounterfactualGenerator(nn.Module):
         decoder_loaded = False
         for candidate in sharpen_candidates:
             if candidate.is_file():
-                print(f"🔄 Loading Sharpened StyleGAN decoder from {candidate}...")
+                print(f"Loading sharpened StyleGAN decoder from {candidate}...")
                 self.load_decoder_checkpoint(candidate, map_location=device)
                 decoder_loaded = True
                 break
@@ -89,13 +89,13 @@ class CounterfactualGenerator(nn.Module):
             if decoder_ckpt_path:
                 ckpt_path = Path(decoder_ckpt_path)
                 if ckpt_path.is_file():
-                    print(f"🔍 Falling back to decoder weights at {ckpt_path}")
+                    print(f"Falling back to decoder weights at {ckpt_path}")
                     self.load_decoder_checkpoint(ckpt_path, map_location=device)
                     decoder_loaded = True
                 else:
-                    print(f"⚠️ Decoder checkpoint not found at {ckpt_path}; starting with random weights.")
+                    print(f"Decoder checkpoint not found at {ckpt_path}; starting with random weights.")
             else:
-                print("⚠️ No sharpened decoder path provided; starting with random weights.")
+                print("No sharpened decoder path provided; starting with random weights.")
 
         for p in self.decoder.parameters():
             p.requires_grad = False

@@ -16,7 +16,7 @@ from tqdm import tqdm
 
 from ..attributes import SELECTED_ATTRIBUTES
 from ..dataset import CelebADataset
-from ..model import ResNet50_CBAM, SquarePadResize
+from ..model import ResNet18_CBAM
 
 
 def build_dataloaders(
@@ -44,17 +44,16 @@ def build_dataloaders(
     pos_weights = torch.tensor(num_neg / (num_pos + 1e-5), dtype=torch.float32)
 
     train_transform = transforms.Compose([
-        SquarePadResize(image_size),
+        transforms.Resize((image_size, image_size)),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        transforms.RandomErasing(p=0.5, scale=(0.02, 0.2), ratio=(0.3, 3.3), value=0),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
     ])
 
     val_transform = transforms.Compose([
-        SquarePadResize(image_size),
+        transforms.Resize((image_size, image_size)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
     ])
 
     train_dataset = CelebADataset(train_df, image_dir, transform=train_transform)
@@ -82,13 +81,13 @@ def build_dataloaders(
 
 
 def create_model(num_classes: int, device: torch.device) -> nn.Module:
-    """Initialise the ResNet50 + CBAM model."""
+    """Initialise the ResNet18 + CBAM model."""
 
-    model = ResNet50_CBAM(num_classes=num_classes)
+    model = ResNet18_CBAM(num_classes=num_classes)
     return model.to(device)
 
 
-def train_resnet50_cbam(
+def train_resnet18_cbam(
     model: nn.Module,
     train_loader: DataLoader,
     val_loader: DataLoader,

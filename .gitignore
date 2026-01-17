@@ -28,3 +28,10 @@ outputs/checkpoints_production/metrics_and_visualisations/metrics_history.csv
 test.ipynb
 running_script copy.ipynb
 classifier_resnet18_cbam.ipynb
+
+Dataset/*
+
+# exclude all .pyc files
+**/*.pyc
+
+outputs/**/*.txt

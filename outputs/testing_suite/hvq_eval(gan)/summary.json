@@ -1,0 +1,52 @@
+{
+  "reconstruction": {
+    "psnr": 26.787051449230585,
+    "ssim": 0.8942429086670128,
+    "lpips": 0.059886793815740594,
+    "mse": 0.008410234476745196,
+    "l1": 0.06522979115670402
+  },
+  "perplexity": {
+    "top": 123.88310460173425,
+    "mid": 346.18902828728335,
+    "bottom": 350.414564474594
+  },
+  "codebook": {
+    "Top_used_codes": 187,
+    "Top_usage_ratio": 0.365234375,
+    "Top_entropy": 4.901022434234619,
+    "Top_normalized_entropy": 0.7856311956839823,
+    "Mid_used_codes": 512,
+    "Mid_usage_ratio": 1.0,
+    "Mid_entropy": 5.931453704833984,
+    "Mid_normalized_entropy": 0.9508087605807176,
+    "Bottom_used_codes": 512,
+    "Bottom_usage_ratio": 1.0,
+    "Bottom_entropy": 5.900167465209961,
+    "Bottom_normalized_entropy": 0.9457935936080907,
+    "top_dead_code_ratio": 0.634765625,
+    "top_avg_active_usage": 9707.123046875,
+    "top_total_assignments": 1815232.0,
+    "mid_dead_code_ratio": 0.0,
+    "mid_avg_active_usage": 14181.5,
+    "mid_total_assignments": 7260928.0,
+    "bottom_dead_code_ratio": 0.0,
+    "bottom_avg_active_usage": 56725.99609375,
+    "bottom_total_assignments": 29043710.0
+  },
+  "semantic": {
+    "attr_consistency": 0.9499898919298708,
+    "attr_delta": 0.18462085009023949,
+    "mutual_info": 0.06703564794518907
+  },
+  "disentanglement": {
+    "mig": 0.13077381497296084,
+    "dci_disentanglement": 0.2648591479368978,
+    "dci_completeness": 0.11914213722506085,
+    "sap": 0.0025105288468931937,
+    "infomec": 0.05821738602226315
+  },
+  "fid": 44.162620544433594,
+  "kid_mean": 0.0503658652305603,
+  "kid_std": 0.0010279748821631074
+}

@@ -115,8 +115,12 @@ class HierarchicalSynthesisNet(nn.Module):
         self.conv_128 = ModulatedConv2d(128, 64, style_dim=style_dim)
         self.to_rgb_128 = ToRGB(64, style_dim)
 
+        # Ensure parameters live in float32 even if AMP is enabled upstream
+        self.float()
+
     def forward(self, z_list, masks=None):
-        z_t, z_m, z_b = z_list
+        # Force float32 inputs to keep StyleGAN math stable under AMP
+        z_t, z_m, z_b = [z.float() for z in z_list]
         w_t = self.mapping(z_t)
         w_m = self.mapping_m(z_m)
         w = w_t + w_m

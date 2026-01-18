@@ -38,6 +38,9 @@ class Config(VQVAEConfig):
         self.sharpening_lpips_weight = 1.0
         self.sharpening_fm_weight = 1.0
         self.sharpening_r1_gamma = 10.0
+        self.sharpening_batch_size = 8
+        self.sharpening_max_batches = 0   # 0 = full epoch; set small for faster runs
+        self.sharpening_sample_size = 4   # samples saved each epoch
 
         # ============================================================================
         # Mutation / Counterfactual Training (comprehensive phase)

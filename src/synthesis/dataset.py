@@ -39,7 +39,7 @@ class CelebADataset(Dataset):
     
     def __init__(self, 
                  root_dir,
-                 split='train',
+                 split=None,
                  image_size=128,
                  num_attributes=40,
                  transform=None,
@@ -48,7 +48,7 @@ class CelebADataset(Dataset):
         """
         Args:
             root_dir: Path to CelebA root directory
-            split: 'train', 'val', or 'test'
+            split: 'train', 'val', 'test', 'all', or None to use the full dataset
             image_size: Target image size (e.g., 128)
             num_attributes: Original argument preserved for compatibility (ignored; SELECTED_ATTRIBUTES used)
             transform: Image transforms
@@ -94,18 +94,23 @@ class CelebADataset(Dataset):
         # Get attribute values [convert -1 to 0, keep 1 as 1]
         attrs_matrix = df[self.attr_names].replace(-1, 0).astype(np.int32).values
         self.attributes = [row for row in attrs_matrix]
-        
-        # Split dataset
-        if use_eval_partition:
-            # Use official list_eval_partition.csv if available
-            partition_file = self.root_dir / "list_eval_partition.csv"
-            if partition_file.exists():
-                self._load_eval_partition(partition_file)
+
+        # Decide whether to keep the full dataset or perform a split
+        full_dataset_requested = (self.split is None) or (
+            isinstance(self.split, str) and self.split.lower() == 'all'
+        )
+
+        if not full_dataset_requested:
+            if use_eval_partition:
+                # Use official list_eval_partition.csv if available
+                partition_file = self.root_dir / "list_eval_partition.csv"
+                if partition_file.exists():
+                    self._load_eval_partition(partition_file)
+                else:
+                    self._use_default_split()
             else:
+                # Use default 70/10/20 split
                 self._use_default_split()
-        else:
-            # Use default 70/10/20 split
-            self._use_default_split()
         
         # Default transforms
         if transform is None:
@@ -120,7 +125,10 @@ class CelebADataset(Dataset):
         else:
             self.transform = transform
         
-        print(f"Loaded {split} split: {len(self.image_names)} images")
+        if full_dataset_requested:
+            print(f"Loaded full dataset: {len(self.image_names)} images")
+        else:
+            print(f"Loaded {split} split: {len(self.image_names)} images")
     
     def _use_default_split(self):
         """Use 70/10/20 train/val/test split"""
@@ -207,13 +215,13 @@ class CelebADataset(Dataset):
             return image, attrs
 
 
-def get_loader(cfg, split='train', batch_size=None, num_workers=None, shuffle=None, return_filename=False):
+def get_loader(cfg, split=None, batch_size=None, num_workers=None, shuffle=None, return_filename=False):
     """
     Create a DataLoader for CelebA
     
     Args:
         cfg: Config object
-        split: 'train', 'val', or 'test'
+        split: 'train', 'val', 'test', 'all', or None to keep the full dataset
         batch_size: Batch size (uses cfg.batch_size if None)
         num_workers: Number of workers (uses cfg.num_workers if None)
         shuffle: Whether to shuffle (True for train, False otherwise)

@@ -53,3 +53,6 @@ validate_test.py
 !inference_batch.py
 *.csv
 *.txt
+!src/readme_images/image_3.png
+!src/readme_images/image_4.png
+!src/readme_images/image_5.png

@@ -37,16 +37,17 @@ class CounterfactualLossManager(nn.Module):
         for p in self.vgg.parameters():
             p.requires_grad = False
         
-        self.mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
-        self.std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+        self.mean = torch.tensor([0.5, 0.5, 0.5], device=device).view(1, 3, 1, 1)
+        self.std = torch.tensor([0.5, 0.5, 0.5], device=device).view(1, 3, 1, 1)
 
         self.base_weights = {
-            'cf': 12.0,
-            'retention': 10.0,
-            'latent_prox': 3.0,
+            'cf': 5,
+            'retention': 4,
+            'latent_prox': 2.0,
             'ortho': 0.4,
             'sparse': 1e-3,
-            'perc': 2.0
+            'perc': 2.0,
+            'nt_consistency': 5
         }
         # Emphasize stability of coarse latents without over-penalizing detail layers
         self.latent_level_weights = [1.4, 1.0, 0.6]
@@ -73,12 +74,6 @@ class CounterfactualLossManager(nn.Module):
             scalar loss
         """
         with torch.no_grad():
-            current_pred = (current_probs > 0.5).float()
-            target_pred = target_labels
-            
-            # Which attributes need to flip (change from current state)
-            needs_flip = (current_pred != target_pred).float() * flip_mask  # [B, num_attrs]
-            
             # Margin targets: push predictions closer to margin bounds
             # If target=1: aim for 0.9 (confident positive)
             # If target=0: aim for 0.1 (confident negative)
@@ -92,9 +87,12 @@ class CounterfactualLossManager(nn.Module):
         margin_loss_per_attr = (probs_new - margin_targets).pow(2)  # [B, num_attrs]
         
         # Weight by flip requirement:
-        # - Attributes that NEED to flip: weight=5.0 (strong push)
-        # - Attributes that DON'T flip: weight=0.1 (allow natural change)
-        weights = needs_flip * 5.0 + (1 - needs_flip) * 0.1  # [B, num_attrs]
+        # IMPORTANT: We always strongly enforce the selected flip attributes.
+        # If we base this on current predictions, a misclassified original image can
+        # accidentally disable the flip pressure (because current_pred may already
+        # match the target). Using flip_mask keeps the objective consistent.
+        flip_mask = flip_mask.float()
+        weights = flip_mask * 5.0 + (1.0 - flip_mask) * 0.1  # [B, num_attrs]
         
         weighted_margin_loss = margin_loss_per_attr * weights
         
@@ -138,7 +136,10 @@ class CounterfactualLossManager(nn.Module):
         lpips_weighted = (lpips_map * mask_down).sum(dim=[1, 2, 3]) / mask_weight
         lpips_loss = lpips_weighted.mean()
 
-        return l1 + lpips_loss * 0.8
+        # Additional L2 penalty to strongly keep background unchanged
+        l2 = ((x_new - x_orig).pow(2) * preserve_mask).mean()
+        # Before was l1
+        return lpips_loss * 0.8 + l2
 
     # ===============================================================
     # 3. Latent Proximity (Minimal Code Change)
@@ -186,12 +187,23 @@ class CounterfactualLossManager(nn.Module):
     def direction_sparsity(self, directions):
         return directions.abs().mean()
 
+    def non_target_consistency(self, logits_new, logits_orig, flip_mask):
+        """Penalize drift on attributes not being flipped."""
+        probs_new = torch.sigmoid(logits_new)
+        probs_orig = torch.sigmoid(logits_orig.detach())
+        keep_mask = 1.0 - flip_mask  # [B, num_attrs]
+        diff_sq = (probs_new - probs_orig).pow(2) * keep_mask
+        denom = keep_mask.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        per_sample = diff_sq.sum(dim=1, keepdim=True) / denom
+        return per_sample.mean()
+
     # ===============================================================
     # 5. Full Generator Loss
     # ===============================================================
     def generator_loss(self,
                        x_orig, x_new,
                        logits_new, target_labels, current_probs,
+                       logits_orig,
                        flip_mask,
                        z_orig_list, z_edited_list,
                        cam_masks,
@@ -203,6 +215,7 @@ class CounterfactualLossManager(nn.Module):
         losses = {}
 
         losses['cf'] = self.counterfactual_loss(logits_new, target_labels, current_probs, flip_mask)
+        losses['nt_consistency'] = self.non_target_consistency(logits_new, logits_orig, flip_mask)
         losses['retention'] = self.masked_retention_loss(x_orig, x_new, cam_masks)
         losses['latent_prox'] = self.latent_proximity_loss(z_orig_list, z_edited_list, cam_masks)
         losses['ortho'] = self.orthogonality_loss(directions)
@@ -212,11 +225,12 @@ class CounterfactualLossManager(nn.Module):
         losses['perc'] = perc_consistency
 
         total = (weights['cf'] * losses['cf'] +
-             weights['retention'] * losses['retention'] +
-             weights['latent_prox'] * losses['latent_prox'] +
-             weights['ortho'] * losses['ortho'] +
-             weights['sparse'] * losses['sparse'] +
-             weights['perc'] * losses['perc'])
+               weights['nt_consistency'] * losses['nt_consistency'] +
+               weights['retention'] * losses['retention'] +
+               weights['latent_prox'] * losses['latent_prox'] +
+               weights['ortho'] * losses['ortho'] +
+               weights['sparse'] * losses['sparse'] +
+               weights['perc'] * losses['perc'])
 
         losses['total'] = total
         return losses

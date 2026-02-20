@@ -5,9 +5,17 @@ import torch
 import torch.nn.functional as F
 import cv2
 import numpy as np
-import matplotlib.pyplot as plt
 from PIL import Image
 from torchvision import transforms
+
+
+try:
+    import matplotlib.pyplot as plt  # type: ignore
+
+    _HAS_MPL = True
+except Exception:
+    plt = None  # type: ignore
+    _HAS_MPL = False
 
 
 class GradCAM:
@@ -209,6 +217,8 @@ def visualize_gradcam(model, image_path, attribute_idx, attribute_name,
         image_size: Size of the image
         method: 'gradcam' or 'gradcam++'
     """
+    if not _HAS_MPL:
+        raise RuntimeError("matplotlib is required for visualize_gradcam(), but it failed to import in this environment.")
     # Load and preprocess image
     image = Image.open(image_path).convert("RGB")
     input_tensor = transform(image).unsqueeze(0).to(device)
@@ -270,3 +280,98 @@ def visualize_gradcam(model, image_path, attribute_idx, attribute_name,
         
     finally:
         cam_extractor.remove_hooks()
+
+
+def gradcamplusplus_batch(
+    model,
+    target_layer,
+    input_batch: torch.Tensor,
+    attribute_idx: int,
+    target_classes: torch.Tensor = None,
+    device: torch.device = None,
+    eps: float = 1e-8,
+) -> np.ndarray:
+    """
+    Compute Grad-CAM++ for a batch of images.
+
+    Args:
+        model: Classifier model
+        target_layer: Module from which to extract activations/gradients
+        input_batch: Input images [B, C, H, W]
+        attribute_idx: Index of the attribute to explain
+        target_classes: Optional tensor of shape [B] with values 0 or 1
+                        If provided, samples with 0 will invert the
+                        objective (i.e., maximize negative score).
+        device: Computation device (defaults to input_batch.device)
+        eps: Small epsilon for numerical stability
+
+    Returns:
+        Numpy array of CAM maps with shape [B, H, W], values normalized to [0,1]
+    """
+    if device is None:
+        device = input_batch.device
+
+    model.eval()
+
+    # Create extractor and register hooks
+    extractor = GradCAMPlusPlus(model, target_layer)
+    extractor.register_hooks()
+
+    try:
+        # Prepare input
+        input_batch = input_batch.clone().detach().to(device).requires_grad_(True)
+
+        # Forward
+        outputs = model(input_batch)  # [B, num_attrs]
+
+        # Select logits for the requested attribute
+        logits = outputs[:, attribute_idx]
+
+        # Determine gradient signs per sample (1 for positive target, -1 for negative)
+        if target_classes is not None:
+            sign = torch.where(target_classes.to(device).view(-1) > 0,
+                               torch.ones_like(logits), -torch.ones_like(logits))
+            grad_outputs = sign
+        else:
+            grad_outputs = torch.ones_like(logits)
+
+        # Backpropagate per-sample scores to get gradients at target layer
+        model.zero_grad()
+        logits.backward(gradient=grad_outputs, retain_graph=False)
+
+        grads = extractor.gradients  # [B, C, H, W]
+        acts = extractor.activations  # [B, C, H, W]
+
+        # Guard against None
+        if grads is None or acts is None:
+            raise RuntimeError("Gradients or activations not captured. Check target_layer hooks.")
+
+        # Grad-CAM++ computations (vectorized over batch)
+        grad_2 = grads.pow(2)
+        grad_3 = grad_2 * grads
+
+        spatial_sum = (acts * grad_3).sum(dim=(2, 3), keepdim=True)  # [B, C, 1, 1]
+        denom = 2 * grad_2 + spatial_sum
+        denom = torch.clamp(denom, min=eps)
+
+        alphas = grad_2 / denom  # Broadcasts over spatial dims -> [B, C, H, W]
+
+        weights = (alphas * torch.relu(grads)).sum(dim=(2, 3), keepdim=True)  # [B, C, 1, 1]
+
+        cam = torch.sum(weights * acts, dim=1)  # [B, H, W]
+        cam = torch.relu(cam)
+
+        # Convert to numpy and normalize each sample to [0,1]
+        cam_np = cam.cpu().detach().numpy()
+        B = cam_np.shape[0]
+        for i in range(B):
+            m = cam_np[i]
+            m -= m.min()
+            maxv = m.max()
+            if maxv > 0:
+                m /= (maxv + eps)
+            cam_np[i] = m
+
+        return cam_np
+    finally:
+        extractor.remove_hooks()

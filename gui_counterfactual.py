@@ -56,8 +56,19 @@ def compute_saliency(
     target_class: int,
     ig_steps: int,
     mask_threshold: float,
+    use_ig: bool = True,
 ) -> tuple[torch.Tensor, list[torch.Tensor], torch.Tensor]:
     """Compute IG saliency map and multi-scale masks."""
+    if not use_ig:
+        h, w = image_tensor.shape[-2:]
+        device = image_tensor.device
+        ig_map = torch.zeros(h, w, device=device)
+        mask_t = torch.zeros(8, 8, device=device)
+        mask_m = torch.zeros(16, 16, device=device)
+        mask_b = torch.zeros(32, 32, device=device)
+        cam_soft = torch.zeros(h, w, device=device)
+        return ig_map.detach(), [mask_t.detach(), mask_m.detach(), mask_b.detach()], cam_soft.detach()
+
     ig_attr = integrated_gradients_batch(
         model=classifier,
         input_batch=image_tensor,
@@ -84,20 +95,17 @@ def compute_saliency(
     mask_t = F.interpolate(
         binary_mask.unsqueeze(0).unsqueeze(0),
         size=(8, 8),
-        mode="bilinear",
-        align_corners=False,
+        mode="nearest",
     ).squeeze(0).squeeze(0)
     mask_m = F.interpolate(
         binary_mask.unsqueeze(0).unsqueeze(0),
         size=(16, 16),
-        mode="bilinear",
-        align_corners=False,
+        mode="nearest",
     ).squeeze(0).squeeze(0)
     mask_b = F.interpolate(
         binary_mask.unsqueeze(0).unsqueeze(0),
         size=(32, 32),
-        mode="bilinear",
-        align_corners=False,
+        mode="nearest",
     ).squeeze(0).squeeze(0)
 
     return ig_map.detach(), [mask_t.detach(), mask_m.detach(), mask_b.detach()], norm_map.detach()
@@ -225,7 +233,7 @@ def run_counterfactual(image: Image.Image, attribute_choice: str):
             target_labels,
             probs,
             attr_idx,
-            hard=True,
+            hard=False,
         )
 
         probs_orig_all = torch.sigmoid(generator.classifier(image_tensor))[0]

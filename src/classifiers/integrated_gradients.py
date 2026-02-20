@@ -63,6 +63,14 @@ def integrated_gradients_batch(
     # Extract logits for target attribute: [B * steps]
     logits = outputs[:, attribute_idx]
 
+    # Make attribution direction-aware when target_classes is provided.
+    # If target_class == 1: increase the logit; if target_class == 0: decrease the logit.
+    if target_classes is not None:
+        # target_classes is [B]; expand to [B*steps]
+        target_flat = target_classes.to(device).view(-1, 1).repeat(1, steps).view(-1)
+        sign = torch.where(target_flat > 0, torch.ones_like(logits), -torch.ones_like(logits))
+        logits = logits * sign
+
     # Compute gradients
     grad_outputs = torch.ones_like(logits)
     grads = torch.autograd.grad(

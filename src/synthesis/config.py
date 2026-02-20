@@ -22,7 +22,6 @@ class Config(VQVAEConfig):
         self.weight_decay = 1e-5
         self.batch_size = 4                # Smaller batch for editing
         self.num_epochs = 50
-        self.accumulation_steps = 8        # Effective batch = 32
         self.num_workers = 4
         
         # ============================================================================
@@ -43,6 +42,7 @@ class Config(VQVAEConfig):
         self.saliency_cache_size = 512
         self.cam_threshold = 0.35
         self.use_ig = True
+        self.gradcamplusplus_use = False
         
         # ============================================================================
         # Synthesis-Specific Data Config
@@ -54,7 +54,7 @@ class Config(VQVAEConfig):
         # Loss Weights (Counterfactual-Specific)
         # ============================================================================
         self.synthesis_loss_weights = {
-            'cf': 10.0,
+            'cf': 18.0,
             'retention': 15.0,
             'latent_prox': 5.0,
             'ortho': 0.5,
@@ -94,6 +94,35 @@ class Config(VQVAEConfig):
         self.sharpening_betas = (0.0, 0.99)
         self.sharpening_checkpoint_dir = "outputs/synth_network/stylegan_decoder_sharpened"
         self.sharpened_decoder_path = ""
+
+        # =========================================================================
+        # Counterfactual Post-processing & Regularization
+        # =========================================================================
+        # Blend in latent space using saliency masks before decoding (soft blending)
+        self.use_decoder_blend = False
+        self.blend_kernel_size = 3  # odd number; 1 = no smoothing
+
+        # Reduce global leakage: keep decoder style vector (w) computed from original latents
+        # instead of edited latents. This prevents local edits from changing global modulation.
+        self.decoder_w_from_orig = True
+
+        # Mutator step controls (reduce if you see leakage/blur)
+        # step = sigmoid(step_logits) * mutator_step_scale + mutator_step_min
+        # NOTE: Large positive bias_init pushes sigmoid() ~ 1.0 from epoch 1,
+        # producing near-max steps immediately (often causes leak + blur).
+        self.mutator_step_min = 0.05
+        self.mutator_step_scale = 1.5
+        self.mutator_mid_mult = 1.2
+        self.mutator_step_bias_init = -2.0
+
+        # Optional: directly scale edit intensity using mean saliency inside the mask.
+        # Recommended safe range: 0.05–0.30. Start small to avoid artifacts, especially
+        # when masks are broad (mask=1/global edit).
+        self.ig_step_gain = 0.10
+
+        # Attribution alignment (optional, disabled by default)
+        self.align_weight = 0.0
+        self.align_interval = 400  # steps between alignment computations
         
         
     @classmethod

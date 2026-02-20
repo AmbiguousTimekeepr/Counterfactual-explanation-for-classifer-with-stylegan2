@@ -7,11 +7,25 @@ class LatentMutator(nn.Module):
     Single-Vector Latent Mutator with Statistical IG Guidance.
     Optimized for memory efficiency and theoretical robustness.
     """
-    def __init__(self, embed_dim=64, num_attributes=40, num_levels=3):
+    def __init__(
+        self,
+        embed_dim=64,
+        num_attributes=40,
+        num_levels=3,
+        step_min: float = 0.1,
+        step_scale: float = 2.5,
+        mid_mult: float = 1.5,
+        bias_init: float = 5.0,
+        ig_step_gain: float = 0.0,
+    ):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_attributes = num_attributes
         self.num_levels = num_levels
+        self.step_min = float(step_min)
+        self.step_scale = float(step_scale)
+        self.mid_mult = float(mid_mult)
+        self.ig_step_gain = float(ig_step_gain)
         self.directions = nn.Parameter(torch.randn(num_attributes, embed_dim) * 0.10)
 
         self.step_predictors = nn.ModuleList()
@@ -26,7 +40,7 @@ class LatentMutator(nn.Module):
                 nn.LeakyReLU(0.2, inplace=True),
                 nn.Linear(64, num_levels)
             )
-            predictor[-1].bias.data.fill_(5.0)
+            predictor[-1].bias.data.fill_(float(bias_init))
             self.step_predictors.append(predictor)
 
     def get_ig_features(self, ig_map):
@@ -98,17 +112,34 @@ class LatentMutator(nn.Module):
 
         steps = []
         for level_idx in range(step_logits.size(1)):
-            step = torch.sigmoid(step_logits[:, level_idx]) * 2.5 + 0.1
+            step = torch.sigmoid(step_logits[:, level_idx]) * self.step_scale + self.step_min
             steps.append(step)
 
         if len(steps) > 1:
-            steps[1] = steps[1] * 1.5
+            steps[1] = steps[1] * self.mid_mult
 
         for level_idx, (z, step) in enumerate(zip(z_list, steps)):
             step_reshaped = step.view(batch_size, 1, 1, 1)
             step_values.append(step_reshaped)
 
             mask = cam_masks[level_idx].unsqueeze(1)
+
+            # Optional: make IG have direct control over edit intensity.
+            # This is intentionally parameter-free (beyond a scalar gain) to keep
+            # backward compatibility with existing checkpoints.
+            if self.ig_step_gain > 0.0:
+                ig_ds = F.interpolate(
+                    ig_map.unsqueeze(1),
+                    size=mask.shape[-2:],
+                    mode='bilinear',
+                    align_corners=False,
+                )
+                # Mean IG inside the edit region (masked mean).
+                denom = mask.sum(dim=[2, 3], keepdim=True).clamp_min(1e-6)
+                ig_level = (ig_ds * mask).sum(dim=[2, 3], keepdim=True) / denom
+                # Nonlinear squash to avoid blow-ups; IG is typically nonnegative.
+                ig_scale = 1.0 + self.ig_step_gain * torch.tanh(ig_level)
+                step_reshaped = step_reshaped * ig_scale
 
             delta = sign * step_reshaped * direction * mask
             z_mutated[level_idx] = z + delta

@@ -12,6 +12,12 @@ class CounterfactualGenerator(nn.Module):
     def __init__(self, cfg, vqvae_path, classifier_path, device='cuda'):
         super().__init__()
         self.device = device
+        # Blend configuration (implemented in latent space before decoding)
+        self.use_latent_blend = bool(getattr(cfg, "use_decoder_blend", False))
+        self.blend_kernel = max(1, int(getattr(cfg, "blend_kernel_size", 3)))
+
+        # Optional: keep decoder style (w) computed from original latents to reduce global leakage.
+        self.decoder_w_from_orig = bool(getattr(cfg, "decoder_w_from_orig", False))
         
         # 1. Frozen VQ-VAE (Encoder only mostly)
         self.vqvae = HVQVAE_3Level(cfg).to(device)
@@ -100,7 +106,16 @@ class CounterfactualGenerator(nn.Module):
         for p in self.decoder.parameters():
             p.requires_grad = False
 
-        self.mutator = LatentMutator(embed_dim=cfg.embed_dim, num_attributes=cfg.num_attributes).to(device)
+        self.mutator = LatentMutator(
+            embed_dim=cfg.embed_dim,
+            num_attributes=cfg.num_attributes,
+            num_levels=3,
+            step_min=float(getattr(cfg, "mutator_step_min", 0.1)),
+            step_scale=float(getattr(cfg, "mutator_step_scale", 2.5)),
+            mid_mult=float(getattr(cfg, "mutator_mid_mult", 1.5)),
+            bias_init=float(getattr(cfg, "mutator_step_bias_init", 5.0)),
+            ig_step_gain=float(getattr(cfg, "ig_step_gain", 0.0)),
+        ).to(device)
 
     @staticmethod
     def _extract_state_dict(ckpt):
@@ -187,6 +202,23 @@ class CounterfactualGenerator(nn.Module):
         z_q = z_perm + (z_q - z_perm).detach()
         return z_q.permute(0, 3, 1, 2).contiguous()
 
+    def _smooth_mask(self, mask_4d: torch.Tensor) -> torch.Tensor:
+        """Optionally smooth a [B,1,H,W] mask with avg pooling."""
+        if self.blend_kernel <= 1:
+            return mask_4d
+
+        h, w = mask_4d.shape[-2], mask_4d.shape[-1]
+        kernel = min(self.blend_kernel, h, w)
+        if kernel <= 1:
+            return mask_4d
+        if kernel % 2 == 0:
+            kernel = max(1, kernel - 1)
+        if kernel <= 1:
+            return mask_4d
+
+        pad = kernel // 2
+        return F.avg_pool2d(mask_4d, kernel_size=kernel, stride=1, padding=pad)
+
     def forward(self, x, ig_map, cam_masks, target_vec, current_probs, attr_idx, hard=True):
         # A. Encode
         with torch.no_grad():
@@ -212,10 +244,35 @@ class CounterfactualGenerator(nn.Module):
         else:
             z_final = z_mutated # Continuous for gradients
 
+        # C2. Latent-space blending (replace pixel-space blend):
+        # Keep original latents outside the saliency mask, apply edits only inside.
+        if self.use_latent_blend and cam_masks is not None:
+            blended = []
+            for level_idx, (z_o, z_e, m) in enumerate(zip(z_list, z_final, cam_masks)):
+                # cam_masks[level] is expected as [B, H_l, W_l]
+                if m is None:
+                    blended.append(z_e)
+                    continue
+                m4 = m.unsqueeze(1).to(z_e.dtype)
+                m4 = m4.clamp(0.0, 1.0)
+                m4 = self._smooth_mask(m4)
+                blended.append(m4 * z_e + (1.0 - m4) * z_o)
+            z_final = blended
+
         # D. Decode (New StyleGAN Decoder)
         # Note: The decoder does NOT need the masks. It renders whatever z_final says.
         # The 'Surgical Precision' comes from the fact that z_final was only edited
         # in specific regions by the Mutator.
-        img_out = self.decoder(z_final)
+
+        w_override = None
+        if self.decoder_w_from_orig:
+            # Compute global style from original latents to avoid global modulation changes.
+            # Note: z_list comes from a no_grad encode path, so this stabilizes style w.r.t edits
+            # while still allowing decoder weights to train.
+            w_t = self.decoder.mapping(z_list[0])
+            w_m = self.decoder.mapping_m(z_list[1])
+            w_override = w_t + w_m
+
+        img_out = self.decoder(z_final, w_override=w_override)
         
         return img_out, z_mutated, step_values

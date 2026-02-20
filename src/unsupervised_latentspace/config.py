@@ -7,9 +7,9 @@ class Config:
         
         # --- Data Params ---
         self.image_size = 128
-        # RTX 2060S Optimization: Lower batch size + Gradient Accumulation
         self.batch_size = 8       # Physical batch size
-        self.accumulation_steps = 4 # Effective batch size = 8 * 4 = 32
+        # RTX 2060S Optimization: Lower batch size
+        # Physical batch is controlled by `batch_size` only; gradient accumulation removed.
         self.num_workers = 4
         self.pin_memory = True
         

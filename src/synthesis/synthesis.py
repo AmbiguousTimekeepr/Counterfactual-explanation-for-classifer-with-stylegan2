@@ -115,11 +115,15 @@ class HierarchicalSynthesisNet(nn.Module):
         self.conv_128 = ModulatedConv2d(128, 64, style_dim=style_dim)
         self.to_rgb_128 = ToRGB(64, style_dim)
 
-    def forward(self, z_list, masks=None):
+    def forward(self, z_list, masks=None, w_override=None):
         z_t, z_m, z_b = z_list
-        w_t = self.mapping(z_t)
-        w_m = self.mapping_m(z_m)
-        w = w_t + w_m
+
+        if w_override is None:
+            w_t = self.mapping(z_t)
+            w_m = self.mapping_m(z_m)
+            w = w_t + w_m
+        else:
+            w = w_override
 
         x = self.input_projector(z_t)
 

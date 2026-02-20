@@ -24,6 +24,7 @@ from .dataset import CelebADataset, get_loader, get_attribute_names
 from .visualizer import CounterfactualVisualizer
 from .discriminator_manager import PatchGANDiscriminator
 from ..classifiers.integrated_gradients import integrated_gradients_batch
+from ..classifiers.gradcam import gradcamplusplus_batch
 
 class ComprehensiveTrainer:
     def __init__(self, cfg, experiment_name="counterfactual_training", device=None):
@@ -51,16 +52,29 @@ class ComprehensiveTrainer:
         self.mask_threshold = getattr(self.cfg, 'cam_threshold', 0.35)
         self.ig_steps = getattr(self.cfg, 'ig_steps', 16)
         self.use_ig = getattr(self.cfg, 'use_ig', True)
+        self.use_gradcampp = getattr(self.cfg, 'gradcamplusplus_use', False)
+        if self.use_ig and self.use_gradcampp:
+            # IG takes precedence when both flags are True
+            self.use_gradcampp = False
         self.saliency_cache = OrderedDict()
         self.saliency_cache_size = getattr(self.cfg, 'saliency_cache_size', 256)
+        self.use_blend = getattr(self.cfg, 'use_decoder_blend', False)
+        self.blend_kernel = max(1, int(getattr(self.cfg, 'blend_kernel_size', 3)))
+        self.align_weight = float(getattr(self.cfg, 'align_weight', 0.0))
+        self.align_interval = int(getattr(self.cfg, 'align_interval', 400))
+        self.gradcampp_target_layer = self._get_gradcampp_target_layer()
+        if self.gradcampp_target_layer:
+            print(f"GradCamPlusPlus Layer: {self.gradcampp_target_layer}")
         
         # Attribute name mapping (restricted CelebA subset)
+        
         self.attr_names = self._get_attribute_names()
         self._initialize_active_attributes()
         self.attr_sample_size = min(
             len(self.active_attr_indices),
             getattr(self.cfg, 'max_active_attributes_per_epoch', len(self.active_attr_indices))
         )
+        print("Active attribute indices:", self.active_attr_indices)
         if self.attr_sample_size <= 0:
             raise ValueError("max_active_attributes_per_epoch must be >= 1")
 
@@ -103,6 +117,10 @@ class ComprehensiveTrainer:
         """Create output directories"""
         timestamp = datetime.now().strftime("%Y%m%d")
         suffix = "_no_ig" if not self.cfg.use_ig else ""
+        suffix = "_gradcampp" if self.cfg.gradcamplusplus_use else suffix
+        mask_mode = str(getattr(self.cfg, 'saliency_mask_mode', 'saliency')).lower()
+        if mask_mode in ("ones", "zeros"):
+            suffix = f"{suffix}_mask_{mask_mode}"
         self.exp_dir = Path(f"outputs/synth_network/CF_generator/{self.experiment_name}_{timestamp}{suffix}")
         self.exp_dir.mkdir(parents=True, exist_ok=True)
         
@@ -194,6 +212,7 @@ class ComprehensiveTrainer:
     def _initialize_active_attributes(self):
         """Derive active attribute indices based on configuration."""
         desired_attrs = getattr(self.cfg, 'active_attributes', None)
+        print("Desired_attrs:", desired_attrs)
         if desired_attrs:
             missing = [attr for attr in desired_attrs if attr not in self.attr_names]
             if missing:
@@ -217,8 +236,10 @@ class ComprehensiveTrainer:
 
         fieldnames = [
             'epoch', 'batch', 'step', 'total_loss',
-            'cf_loss', 'retention_loss', 'latent_prox_loss',
-            'ortho_loss', 'sparse_loss', 'perc_loss', 'adv_loss', 'disc_loss', 'lr',
+            'cf_loss', 'nt_consistency_loss', 'retention_loss', 'latent_prox_loss',
+            'ortho_loss', 'sparse_loss', 'perc_loss', 'adv_loss', 'disc_loss', 'align_loss', 'lr',
+            'dx_l2_total', 'dx_l2_outside', 'dx_l2_inside', 'dx_l2_outside_ratio',
+            'dx_l1_total', 'dx_l1_outside', 'dx_l1_inside', 'dx_l1_outside_ratio',
             'embed_orig_top', 'embed_orig_mid', 'embed_orig_bot',
             'embed_cf_top', 'embed_cf_mid', 'embed_cf_bot',
             'step_top', 'step_mid', 'step_bot'
@@ -227,20 +248,84 @@ class ComprehensiveTrainer:
         self.csv_writer = csv.DictWriter(self.csv_file, fieldnames=fieldnames)
         self.csv_writer.writeheader()
         self.csv_file.flush()
+
+    def _compute_outside_mask_metrics(self, x_orig: torch.Tensor, x_new: torch.Tensor, cam_masks):
+        """Compute how much change energy happens outside the edit mask.
+
+        Returns a dict with totals and outside ratios for both L2 (squared) and L1 (abs) energies.
+        Mask convention: cam_masks indicates EDIT region (1=edit). Outside means preserve region.
+        """
+        if cam_masks is None or len(cam_masks) == 0:
+            return {}
+
+        with torch.no_grad():
+            h, w = x_orig.shape[-2:]
+            masks_4d = [m.unsqueeze(1) if m.ndim == 3 else m for m in cam_masks]
+            # Nearest to keep binary-ish boundaries.
+            combined_mask = torch.clamp_max(
+                torch.stack([
+                    F.interpolate(m.float(), size=(h, w), mode='nearest')
+                    for m in masks_4d
+                ]).sum(0),
+                1.0,
+            ).clamp(0.0, 1.0)  # [B,1,H,W]
+
+            outside = 1.0 - combined_mask
+            inside = combined_mask
+
+            dx = (x_new - x_orig).float()
+            # Aggregate per-pixel across channels.
+            dx_l2_map = dx.pow(2).sum(dim=1, keepdim=True)  # [B,1,H,W]
+            dx_l1_map = dx.abs().sum(dim=1, keepdim=True)
+
+            eps = 1e-8
+            l2_total = dx_l2_map.sum(dim=[1, 2, 3])
+            l2_out = (dx_l2_map * outside).sum(dim=[1, 2, 3])
+            l2_in = (dx_l2_map * inside).sum(dim=[1, 2, 3])
+            l2_ratio_out = torch.where(l2_total > eps, l2_out / (l2_total + eps), torch.zeros_like(l2_total))
+
+            l1_total = dx_l1_map.sum(dim=[1, 2, 3])
+            l1_out = (dx_l1_map * outside).sum(dim=[1, 2, 3])
+            l1_in = (dx_l1_map * inside).sum(dim=[1, 2, 3])
+            l1_ratio_out = torch.where(l1_total > eps, l1_out / (l1_total + eps), torch.zeros_like(l1_total))
+
+            # Batch means for logging.
+            return {
+                'dx_l2_total': l2_total.mean(),
+                'dx_l2_outside': l2_out.mean(),
+                'dx_l2_inside': l2_in.mean(),
+                'dx_l2_outside_ratio': l2_ratio_out.mean(),
+                'dx_l1_total': l1_total.mean(),
+                'dx_l1_outside': l1_out.mean(),
+                'dx_l1_inside': l1_in.mean(),
+                'dx_l1_outside_ratio': l1_ratio_out.mean(),
+            }
         
     def _get_attribute_names(self):
         """Get active CelebA attribute names"""
         return get_attribute_names()
 
+    def _get_gradcampp_target_layer(self):
+        """Pick a reasonable target layer for Grad-CAM++ (CBAM > layer4)."""
+        clf = getattr(self.model, 'classifier', None)
+        return clf.cbam4
+        if clf is None:
+            return None
+        if hasattr(clf, 'cbam4'):
+            return clf.cbam4
+        if hasattr(clf, 'layer4'):
+            return clf.layer4
+        return None
+
     def _compute_saliency_for_sample(self, image_tensor, attr_idx, target_class, cache_key=None):
         """Compute IG map and sharpened retention masks for a single sample."""
-        if not self.use_ig:
+        if not self.use_ig and not self.use_gradcampp:
             h, w = image_tensor.shape[-2:]
             ig_map = torch.ones(h, w, device=image_tensor.device)
             mask_t = torch.ones(8, 8, device=image_tensor.device)
             mask_m = torch.ones(16, 16, device=image_tensor.device)
             mask_b = torch.ones(32, 32, device=image_tensor.device)
-            cam_soft = torch.zeros(h, w, device=image_tensor.device)
+            cam_soft = torch.ones(h, w, device=image_tensor.device)
             return ig_map, [mask_t, mask_m, mask_b], cam_soft
 
         cached = self._cache_get(cache_key)
@@ -249,21 +334,52 @@ class ComprehensiveTrainer:
             ig_map = ig_cached.to(self.device)
             masks = [mask.to(self.device) for mask in masks_cached]
             cam_soft = cam_cached.to(self.device)
+
+            # Mask ablation override
+            if getattr(self, 'saliency_mask_mode', 'saliency') in ("ones", "zeros"):
+                fill = 1.0 if self.saliency_mask_mode == "ones" else 0.0
+                ig_map = torch.full_like(ig_map, fill)
+                masks = [torch.full_like(m, fill) for m in masks]
+                cam_soft = torch.full_like(cam_soft, fill)
             return ig_map, masks, cam_soft
 
-        # Use integrated_gradients_batch instead
-        ig_attr = integrated_gradients_batch(
-            model=self.model.classifier,
-            input_batch=image_tensor,
-            attribute_idx=attr_idx,
-            target_classes=torch.tensor([int(target_class)], device=self.device),
-            steps=self.ig_steps,
-            device=self.device
-        )
+        if self.use_ig:
+            # Use integrated_gradients_batch instead
+            ig_attr = integrated_gradients_batch(
+                model=self.model.classifier,
+                input_batch=image_tensor,
+                attribute_idx=attr_idx,
+                target_classes=torch.tensor([int(target_class)], device=self.device),
+                steps=self.ig_steps,
+                device=self.device
+            )
 
-        raw_saliency = torch.abs(ig_attr).sum(dim=1, keepdim=True)
-        flat_max = raw_saliency.view(raw_saliency.size(0), -1).amax(dim=1, keepdim=True).view(-1, 1, 1, 1)
-        ig_map = (raw_saliency / (flat_max + 1e-8)).squeeze(0).squeeze(0).detach()
+            # IMPORTANT: keep direction information.
+            # integrated_gradients_batch is direction-aware via target_classes, so we should
+            # focus on positive contributions to the objective instead of abs().
+            raw_saliency = F.relu(ig_attr).sum(dim=1, keepdim=True)
+            flat_max = raw_saliency.view(raw_saliency.size(0), -1).amax(dim=1, keepdim=True).view(-1, 1, 1, 1)
+            ig_map = (raw_saliency / (flat_max + 1e-8)).squeeze(0).squeeze(0).detach()
+        elif self.use_gradcampp:
+            if self.gradcampp_target_layer is None:
+                raise RuntimeError("Grad-CAM++ target layer not found on classifier.")
+            cam_np = gradcamplusplus_batch(
+                model=self.model.classifier,
+                target_layer=self.gradcampp_target_layer,
+                input_batch=image_tensor,
+                attribute_idx=attr_idx,
+                target_classes=torch.tensor([int(target_class)], device=self.device),
+                device=self.device
+            )
+            cam_t = torch.from_numpy(cam_np).to(self.device).unsqueeze(1)  # [1,1,h,w]
+            cam_t = F.interpolate(
+                cam_t,
+                size=image_tensor.shape[-2:],
+                mode='bilinear',
+                align_corners=False
+            )
+            raw_saliency = cam_t
+            ig_map = cam_t.squeeze(0).squeeze(0).detach()
 
         smooth = F.avg_pool2d(raw_saliency, kernel_size=11, stride=1, padding=5)
         norm = smooth / (smooth.amax(dim=[1, 2, 3], keepdim=True) + 1e-8)
@@ -280,26 +396,32 @@ class ComprehensiveTrainer:
         mask_t = F.interpolate(
             binary_mask.unsqueeze(0).unsqueeze(0),
             size=(8, 8),
-            mode='bilinear',
-            align_corners=False
+            mode='nearest'
         ).squeeze(0).squeeze(0)
         mask_m = F.interpolate(
             binary_mask.unsqueeze(0).unsqueeze(0),
             size=(16, 16),
-            mode='bilinear',
-            align_corners=False
+            mode='nearest'
         ).squeeze(0).squeeze(0)
         mask_b = F.interpolate(
             binary_mask.unsqueeze(0).unsqueeze(0),
             size=(32, 32),
-            mode='bilinear',
-            align_corners=False
+            mode='nearest'
         ).squeeze(0).squeeze(0)
 
         ig_to_store = ig_map.detach().cpu()
         masks_to_store = [mask_t.detach().cpu(), mask_m.detach().cpu(), mask_b.detach().cpu()]
         cam_to_store = norm_map.detach().cpu()
         self._cache_set(cache_key, (ig_to_store, masks_to_store, cam_to_store))
+
+        # Mask ablation override
+        if getattr(self, 'saliency_mask_mode', 'saliency') in ("ones", "zeros"):
+            fill = 1.0 if self.saliency_mask_mode == "ones" else 0.0
+            ig_map = torch.full_like(ig_map, fill)
+            mask_t = torch.full_like(mask_t, fill)
+            mask_m = torch.full_like(mask_m, fill)
+            mask_b = torch.full_like(mask_b, fill)
+            norm_map = torch.full_like(norm_map, fill)
 
         return ig_map, [mask_t.detach(), mask_m.detach(), mask_b.detach()], norm_map.detach()
 
@@ -308,7 +430,7 @@ class ComprehensiveTrainer:
         batch_size = images.size(0)
         device = images.device
 
-        if not self.use_ig:
+        if not self.use_ig and not self.use_gradcampp:
             h, w = images.shape[-2:]
             ig_maps = torch.ones(batch_size, h, w, device=device)
             mask_t = torch.ones(batch_size, 8, 8, device=device)
@@ -354,21 +476,44 @@ class ComprehensiveTrainer:
             uncached_images = images[uncached_indices]  # [U, C, H, W]
             uncached_targets = target_classes[uncached_indices]  # [U]
             
-            # Batch integrated gradients
-            ig_batch = integrated_gradients_batch(
-                model=self.model.classifier,
-                input_batch=uncached_images,
-                attribute_idx=attr_idx,
-                target_classes=uncached_targets,
-                steps=self.ig_steps,
-                device=device
-            )  # [U, C, H, W]
-            
-            # Compute IG maps (vectorized)
-            raw_saliency = torch.abs(ig_batch).sum(dim=1, keepdim=True)  # [U, 1, H, W]
-            flat_max = raw_saliency.view(raw_saliency.size(0), -1).amax(dim=1, keepdim=True)
-            flat_max = flat_max.view(-1, 1, 1, 1)
-            ig_normalized = (raw_saliency / (flat_max + 1e-8)).squeeze(1)  # [U, H, W]
+            if self.use_ig:
+                # Batch integrated gradients
+                ig_batch = integrated_gradients_batch(
+                    model=self.model.classifier,
+                    input_batch=uncached_images,
+                    attribute_idx=attr_idx,
+                    target_classes=uncached_targets,
+                    steps=self.ig_steps,
+                    device=device
+                )  # [U, C, H, W]
+                
+                # Compute IG maps (vectorized)
+                raw_saliency = F.relu(ig_batch).sum(dim=1, keepdim=True)  # [U, 1, H, W]
+                flat_max = raw_saliency.view(raw_saliency.size(0), -1).amax(dim=1, keepdim=True)
+                flat_max = flat_max.view(-1, 1, 1, 1)
+                ig_normalized = (raw_saliency / (flat_max + 1e-8)).squeeze(1)  # [U, H, W]
+            elif self.use_gradcampp:
+                if self.gradcampp_target_layer is None:
+                    raise RuntimeError("Grad-CAM++ target layer not found on classifier.")
+                cam_np = gradcamplusplus_batch(
+                    model=self.model.classifier,
+                    target_layer=self.gradcampp_target_layer,
+                    input_batch=uncached_images,
+                    attribute_idx=attr_idx,
+                    target_classes=uncached_targets,
+                    device=device
+                )  # [U, h, w] numpy
+                cam_t = torch.from_numpy(cam_np).to(device)
+                raw_saliency = cam_t.unsqueeze(1)  # [U, 1, h, w]
+                raw_saliency = F.interpolate(
+                    raw_saliency,
+                    size=uncached_images.shape[-2:],
+                    mode='bilinear',
+                    align_corners=False
+                )
+                flat_max = raw_saliency.view(raw_saliency.size(0), -1).amax(dim=1, keepdim=True)
+                flat_max = flat_max.view(-1, 1, 1, 1)
+                ig_normalized = (raw_saliency / (flat_max + 1e-8)).squeeze(1)
             
             # Compute sharpened masks (vectorized)
             smooth = F.avg_pool2d(raw_saliency, kernel_size=11, stride=1, padding=5)  # [U, 1, H, W]
@@ -387,9 +532,9 @@ class ComprehensiveTrainer:
             
             # Resize to different scales (vectorized)
             binary_4d = binary_mask.unsqueeze(1)  # [U, 1, H, W]
-            masks_t_batch = F.interpolate(binary_4d, size=(8, 8), mode='bilinear', align_corners=False).squeeze(1)
-            masks_m_batch = F.interpolate(binary_4d, size=(16, 16), mode='bilinear', align_corners=False).squeeze(1)
-            masks_b_batch = F.interpolate(binary_4d, size=(32, 32), mode='bilinear', align_corners=False).squeeze(1)
+            masks_t_batch = F.interpolate(binary_4d, size=(8, 8), mode='nearest').squeeze(1)
+            masks_m_batch = F.interpolate(binary_4d, size=(16, 16), mode='nearest').squeeze(1)
+            masks_b_batch = F.interpolate(binary_4d, size=(32, 32), mode='nearest').squeeze(1)
             
             # Fill in results and update cache
             for local_idx, global_idx in enumerate(uncached_indices):
@@ -412,10 +557,126 @@ class ComprehensiveTrainer:
         masks_batch = [mask_t, mask_m, mask_b]
         return ig_maps, masks_batch
 
+    def _blend_with_saliency_masks(self, images, x_new, masks, ig_map=None):
+        """Blend x_new with images using multi-scale saliency masks (preferred) or ig_map fallback.
+
+        Args:
+            images: [B,3,H,W] original images
+            x_new: [B,3,H,W] generated images
+            masks: list of 3 tensors [B,Hl,Wl] (8/16/32) or compatible
+            ig_map: optional [B,H,W] IG map for fallback
+        Returns:
+            x_eff: blended image in same range as inputs (typically [-1,1])
+        """
+        if not getattr(self, 'use_blend', False):
+            return x_new
+
+        try:
+            m_t = masks[0].unsqueeze(1)
+            m_m = masks[1].unsqueeze(1)
+            m_b = masks[2].unsqueeze(1)
+
+            m_t_up = F.interpolate(m_t, size=images.shape[-2:], mode='bilinear', align_corners=False)
+            m_m_up = F.interpolate(m_m, size=images.shape[-2:], mode='bilinear', align_corners=False)
+            m_b_up = F.interpolate(m_b, size=images.shape[-2:], mode='bilinear', align_corners=False)
+
+            blend_mask = torch.clamp(m_t_up + m_m_up + m_b_up, 0.0, 1.0)
+        except Exception:
+            if ig_map is None:
+                return x_new
+            blend_mask = ig_map.unsqueeze(1).clamp(0.0, 1.0)
+
+        if getattr(self, 'blend_kernel', 1) > 1:
+            pad = self.blend_kernel // 2
+            blend_mask = F.avg_pool2d(blend_mask, kernel_size=self.blend_kernel, stride=1, padding=pad)
+
+        return blend_mask * x_new + (1 - blend_mask) * images
+
+    def _print_mask_stats(self, mask: torch.Tensor, name: str, threshold: float = 0.3):
+        """Print quick stats to spot mask softness/leak at each scale."""
+        if mask is None:
+            print(f"[mask-debug] {name}: None")
+            return
+        m = mask.detach()
+        if m.ndim == 2:
+            m = m.unsqueeze(0)
+        m = m.float()
+        frac_on = (m > threshold).float().mean().item()
+        frac_half = (m > 0.5).float().mean().item()
+        frac_nonzero = (m > 1e-6).float().mean().item()
+        print(
+            f"[mask-debug] {name}: shape={tuple(m.shape)}, min={m.min().item():.3f}, "
+            f"max={m.max().item():.3f}, mean={m.mean().item():.3f}, "
+            f">{threshold:.1f}={frac_on:.3f}, >0.5={frac_half:.3f}, >0={frac_nonzero:.3f}"
+        )
+
+    def _save_mask_debug_panel(self, images, ig_map, masks, epoch: int, batch_idx: int, attr_idx: int, filenames=None):
+        """Save a PNG panel visualizing IG + masks at 8/16/32 (upsampled)."""
+        try:
+            out_dir = self.vis_dir / "mask_debug"
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            img = images[0:1].detach()
+            base_np = self._tensor_to_image(img)
+
+            ig0 = ig_map[0].detach().cpu() if isinstance(ig_map, torch.Tensor) else None
+
+            # Prepare upsampled masks to image size for visualization
+            mask_names = [("mask_8", masks[0]), ("mask_16", masks[1]), ("mask_32", masks[2])]
+            upsampled = []
+            for name, m in mask_names:
+                if m is None:
+                    upsampled.append((name, None))
+                    continue
+                m0 = m[0:1].unsqueeze(1).float()  # [1,1,h,w]
+                m_up = F.interpolate(m0, size=images.shape[-2:], mode='bilinear', align_corners=False).squeeze(0).squeeze(0)
+                upsampled.append((name, m_up.detach().cpu()))
+
+            fig, axes = plt.subplots(1, 5, figsize=(18, 4))
+            axes[0].imshow(base_np)
+            axes[0].set_title("orig")
+            axes[0].axis('off')
+
+            if ig0 is not None:
+                axes[1].imshow(self.visualizer.apply_cam_overlay(base_np, ig0, alpha=0.5))
+            else:
+                axes[1].imshow(base_np)
+            axes[1].set_title("IG")
+            axes[1].axis('off')
+
+            for ax_i, (name, m_up) in enumerate(upsampled, start=2):
+                if m_up is None:
+                    axes[ax_i].imshow(base_np)
+                    axes[ax_i].set_title(f"{name}: None")
+                else:
+                    axes[ax_i].imshow(self.visualizer.apply_cam_overlay(base_np, m_up, alpha=0.5))
+                    axes[ax_i].set_title(name)
+                axes[ax_i].axis('off')
+
+            attr_name = self.attr_names[attr_idx] if hasattr(self, 'attr_names') and attr_idx < len(self.attr_names) else str(attr_idx)
+            fname = None
+            if filenames is not None and len(filenames) > 0 and filenames[0] is not None:
+                fname = self._sanitize_filename(Path(str(filenames[0])).stem)
+            else:
+                fname = "sample0"
+            out_path = out_dir / f"epoch_{epoch+1:03d}_batch_{batch_idx+1:04d}_{fname}_attr_{attr_name}.png"
+            fig.suptitle(f"Mask debug | epoch {epoch+1} batch {batch_idx+1} | attr {attr_name}")
+            fig.savefig(out_path, dpi=160, bbox_inches='tight')
+            plt.close(fig)
+        except Exception as e:
+            print(f"[mask-debug] Failed to save panel: {e}")
+
     def _sanitize_filename(self, name):
         """Sanitize filename component by keeping alphanumerics, dash, underscore."""
         return ''.join(ch if ch.isalnum() or ch in ('_', '-') else '_' for ch in name)
 
+    def _tensor_to_image(self, tensor):
+        """Wrapper to convert tensor -> HWC numpy using the visualizer helper.
+
+        Some legacy code calls `_tensor_to_image`; the visualizer already
+        implements the conversion, so delegate to it.
+        """
+        return self.visualizer.tensor_to_image(tensor)
     def _run_epoch_inference(self, epoch, loader_test, num_images=4):
         """Run inference visualizations on test split and save overlays per attribute."""
         if loader_test is None:
@@ -497,6 +758,8 @@ class ComprehensiveTrainer:
                             hard=True
                         )
 
+                    # Note: blending is applied inside the generator in latent space when enabled.
+
                     ig_overlay = self._create_overlay(base_np, ig_map)
                     cam_overlay = self._create_overlay(base_np, cam_soft)
                     cf_np = self._tensor_to_image(x_cf)
@@ -552,16 +815,22 @@ class ComprehensiveTrainer:
         self.discriminator.train()
         
         epoch_losses = {
-            'total': [], 'cf': [], 'retention': [], 'latent_prox': [],
-            'ortho': [], 'sparse': [], 'perc': [], 'adv': [], 'disc': []
+            'total': [], 'cf': [], 'nt_consistency': [], 'retention': [], 'latent_prox': [],
+            'ortho': [], 'sparse': [], 'perc': [], 'adv': [], 'disc': [], 'align': []
         }
         attr_losses = {i: [] for i in self.active_attr_indices}
-        
         pbar = tqdm(loader, desc=f"Epoch {epoch} / {self.cfg.num_epochs}")
-        accumulation_steps = self.cfg.accumulation_steps
+        # No gradient accumulation used — optimizer steps per batch.
         
-        attr_cycle = itertools.cycle(random.sample(self.active_attr_indices, self.attr_sample_size))
+        # Disable decoder training for initial epochs if specified
+        # if epoch < 5:
+        #     for p in self.model.decoder.parameters():
+        #         p.requires_grad = False
+        # else:
+        #     for p in self.model.decoder.parameters():
+        #         p.requires_grad = True
 
+        attr_cycle = itertools.cycle(random.sample(self.active_attr_indices, self.attr_sample_size))
         for batch_idx, batch in enumerate(pbar):
             if isinstance(batch, (list, tuple)) and len(batch) == 3:
                 images, labels, filenames = batch
@@ -587,6 +856,38 @@ class ComprehensiveTrainer:
                 filenames=filenames_batch
             )
 
+            # Debug: dump masks at 8/16/32 to verify they are not overly soft/leaky.
+            # Trigger only on first batch of each epoch to keep overhead low.
+            # if batch_idx == 0:
+            #     self._print_mask_stats(masks[0], "mask_8")
+            #     self._print_mask_stats(masks[1], "mask_16")
+            #     self._print_mask_stats(masks[2], "mask_32")
+            #     self._save_mask_debug_panel(images, ig_map, masks, epoch, batch_idx, attr_idx, filenames=filenames_batch)
+            
+            # #Plot saliency first signal map and overlay for debugging
+            # if batch_idx == 0 and epoch % 5 == 0:
+            #     # base_np = self._tensor_to_image(images[0:1])
+            #     # No tensor to image conversion helper for batch
+            #     base_np = images[0].detach().cpu().permute(1, 2, 0).numpy()
+            #     base_np = (base_np - base_np.min()) / (base_np.max() - base_np.min() + 1e-8)
+            #     # ig_overlay = self._create_overlay(base_np, ig_map[0].detach().cpu())
+            #     # Manual overlay creation
+            #     ig_map_np = ig_map[0].detach().cpu().numpy()
+            #     cmap = plt.get_cmap('jet')
+            #     ig_colored = cmap(ig_map_np)[:, :, :3]
+            #     ig_colored = (ig_colored - ig_colored.min()) / (ig_colored.max() - ig_colored.min() + 1e-8)
+            #     ig_overlay = (0.5 * base_np + 0.5 * ig_colored)
+
+            #     debug_fig, debug_ax = plt.subplots(1, 2, figsize=(8, 4))
+            #     debug_ax[0].imshow(base_np)
+            #     debug_ax[0].set_title("Original Image")
+            #     debug_ax[0].axis('off')
+            #     debug_ax[1].imshow(ig_overlay)
+            #     debug_ax[1].set_title("IG Overlay")
+            #     debug_ax[1].axis('off')
+            #     debug_path = self.vis_dir / f"epoch_{epoch + 1}_batch_{batch_idx + 1}_ig_debug.png"
+            #     debug_fig.savefig(debug_path, dpi=150, bbox_inches='tight')
+            #     plt.close(debug_fig)
             with torch.no_grad():
                 logits = self.model.classifier(images)
                 probs = torch.sigmoid(logits)
@@ -594,7 +895,9 @@ class ComprehensiveTrainer:
             with torch.no_grad():
                 z_orig_list = self.model.vqvae.get_codes(images)
 
-            use_hard = (epoch >= 5)
+            # Re-quantization keeps edited latents on the VQ manifold.
+            # Leaving it off for too long tends to cause progressively blurrier outputs.
+            use_hard = False
 
             # ====================================================
             # PHASE 1: Train Discriminator (Realism enforcement)
@@ -612,6 +915,9 @@ class ComprehensiveTrainer:
                     attr_idx,
                     hard=use_hard
                 )
+            if self.use_blend:
+                # Blending now happens inside the generator in latent space; do not re-blend in pixel space.
+                pass
 
             logits_real = self.discriminator(images)
             d_loss_real = F.relu(1.0 - logits_real).mean()
@@ -643,14 +949,18 @@ class ComprehensiveTrainer:
                     hard=use_hard
                 )
 
-                new_logits = self.model.classifier(x_new)
+                # Blending is performed inside the generator in latent space when enabled.
+                x_eff = x_new
+
+                new_logits = self.model.classifier(x_eff)
 
                 flip_mask = torch.zeros_like(labels)
                 flip_mask[:, attr_idx] = 1.0
 
                 losses = self.loss_manager.generator_loss(
-                    images, x_new,
+                    images, x_eff,
                     new_logits, target_labels, probs,
+                    logits,
                     flip_mask,
                     z_orig_list, z_mutated,
                     masks,
@@ -658,7 +968,7 @@ class ComprehensiveTrainer:
                     weights=self._get_dynamic_loss_weights(epoch)
                 )
 
-                logits_fake_for_g = self.discriminator(x_new)
+                logits_fake_for_g = self.discriminator(x_eff)
                 g_adv_loss = -logits_fake_for_g.mean()
                 losses['adv'] = g_adv_loss
 
@@ -666,12 +976,52 @@ class ComprehensiveTrainer:
                 losses['total'] = base_total + self.adv_weight * g_adv_loss
                 losses['disc'] = disc_loss_value
 
-                total_loss = losses['total'] / accumulation_steps
-            
+                # Optional IG alignment regularizer (sparse, low weight)
+                align_loss_value = torch.tensor(0.0, device=self.device)
+                if self.align_weight > 0.0 and (self.global_step % max(self.align_interval, 1) == 0):
+                    if self.use_ig:
+                        ig_cf = integrated_gradients_batch(
+                            model=self.model.classifier,
+                            input_batch=x_eff,
+                            attribute_idx=attr_idx,
+                            target_classes=target_labels[:, attr_idx],
+                            steps=self.ig_steps,
+                            device=self.device
+                        )
+                        raw_saliency_cf = F.relu(ig_cf).sum(dim=1, keepdim=True)
+                    elif self.use_gradcampp:
+                        if self.gradcampp_target_layer is None:
+                            raise RuntimeError("Grad-CAM++ target layer not found on classifier.")
+                        cam_cf_np = gradcamplusplus_batch(
+                            model=self.model.classifier,
+                            target_layer=self.gradcampp_target_layer,
+                            input_batch=x_eff,
+                            attribute_idx=attr_idx,
+                            target_classes=target_labels[:, attr_idx],
+                            device=self.device
+                        )
+                        cam_cf_t = torch.from_numpy(cam_cf_np).to(self.device).unsqueeze(1)
+                        raw_saliency_cf = cam_cf_t
+
+                    smooth_cf = F.avg_pool2d(raw_saliency_cf, kernel_size=11, stride=1, padding=5)
+                    norm_cf = smooth_cf / (smooth_cf.amax(dim=[1, 2, 3], keepdim=True) + 1e-8)
+                    norm_cf = norm_cf.pow(1.5)
+                    cam_cf = F.interpolate(norm_cf, size=images.shape[-2:], mode='bilinear', align_corners=False).squeeze(1).clamp(0.0, 1.0)
+                    align_loss_value = F.mse_loss(cam_cf, ig_map.detach())
+
+                losses['align'] = align_loss_value
+                losses['total'] = losses['total'] + self.align_weight * align_loss_value
+
+                # Locality diagnostics: how much of the change happens outside the edit mask.
+                # These are metrics (not used in optimization) to compare IG vs no-IG or different thresholds.
+                dx_metrics = self._compute_outside_mask_metrics(images, x_eff, masks)
+                losses.update(dx_metrics)
+
+                total_loss = losses['total']
             # --- Backward pass ---
             self.scaler.scale(total_loss).backward()
             
-            if (batch_idx + 1) % accumulation_steps == 0:
+            if (batch_idx + 1) % 1 == 0:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 self.optimizer.zero_grad()
@@ -679,7 +1029,10 @@ class ComprehensiveTrainer:
                 
                 # Record losses
                 for key in epoch_losses.keys():
-                    epoch_losses[key].append(losses[key].item())
+                    if key in losses:
+                        epoch_losses[key].append(losses[key].item())
+                    else:
+                        epoch_losses[key].append(0.0)
                 
                 attr_losses[attr_idx].append(losses['cf'].item())
 
@@ -707,10 +1060,17 @@ class ComprehensiveTrainer:
     def _get_dynamic_loss_weights(self, epoch):
         base_weights = self.loss_manager.base_weights
         dynamic = base_weights.copy()
-        dynamic['cf'] = base_weights['cf'] * 2.0
-        if epoch < 10:
-            dynamic['retention'] = 0.0
-            dynamic['latent_prox'] = 0.0
+        # Keep counterfactual pressure strong, but avoid turning off stability terms.
+        # Zeroing retention/latent proximity early allows global drift from epoch 1
+        # (leak) and tends to increase blur over epochs.
+        dynamic['cf'] = base_weights['cf'] * 1.5
+
+        warmup_epochs = 10
+        # epoch=0 -> ~0.35, ramps to 1.0 by warmup end
+        t = min(1.0, float(epoch + 1) / float(warmup_epochs))
+        stability_scale = 0.3 + 0.7 * t
+        dynamic['retention'] = base_weights.get('retention', 0.0) * stability_scale
+        dynamic['latent_prox'] = base_weights.get('latent_prox', 0.0) * stability_scale
         return dynamic
 
     def _log_step(self, epoch, batch_idx, losses, attr_idx, embedding_info):
@@ -724,6 +1084,22 @@ class ComprehensiveTrainer:
         self.writer.add_scalar('Loss/perc', losses['perc'].item(), self.global_step)
         self.writer.add_scalar('Loss/adv', losses['adv'].item(), self.global_step)
         self.writer.add_scalar('Loss/disc', losses['disc'].item(), self.global_step)
+        if 'nt_consistency' in losses:
+            self.writer.add_scalar('Loss/nt_consistency', losses['nt_consistency'].item(), self.global_step)
+        if 'align' in losses:
+            self.writer.add_scalar('Loss/align', losses['align'].item(), self.global_step)
+
+        # Change locality metrics
+        if 'dx_l2_outside_ratio' in losses:
+            self.writer.add_scalar('Mask/dx_l2_outside_ratio', losses['dx_l2_outside_ratio'].item(), self.global_step)
+            self.writer.add_scalar('Mask/dx_l2_total', losses['dx_l2_total'].item(), self.global_step)
+            self.writer.add_scalar('Mask/dx_l2_outside', losses['dx_l2_outside'].item(), self.global_step)
+            self.writer.add_scalar('Mask/dx_l2_inside', losses['dx_l2_inside'].item(), self.global_step)
+        if 'dx_l1_outside_ratio' in losses:
+            self.writer.add_scalar('Mask/dx_l1_outside_ratio', losses['dx_l1_outside_ratio'].item(), self.global_step)
+            self.writer.add_scalar('Mask/dx_l1_total', losses['dx_l1_total'].item(), self.global_step)
+            self.writer.add_scalar('Mask/dx_l1_outside', losses['dx_l1_outside'].item(), self.global_step)
+            self.writer.add_scalar('Mask/dx_l1_inside', losses['dx_l1_inside'].item(), self.global_step)
         
         row = {
             'epoch': epoch,
@@ -731,6 +1107,7 @@ class ComprehensiveTrainer:
             'step': self.global_step,
             'total_loss': losses['total'].item(),
             'cf_loss': losses['cf'].item(),
+            'nt_consistency_loss': losses.get('nt_consistency', torch.tensor(0.0)).item(),
             'retention_loss': losses['retention'].item(),
             'latent_prox_loss': losses['latent_prox'].item(),
             'ortho_loss': losses['ortho'].item(),
@@ -738,7 +1115,16 @@ class ComprehensiveTrainer:
             'perc_loss': losses['perc'].item(),
             'adv_loss': losses['adv'].item(),
             'disc_loss': losses['disc'].item(),
+            'align_loss': losses.get('align', torch.tensor(0.0)).item(),
             'lr': self.optimizer.param_groups[0]['lr'],
+            'dx_l2_total': losses.get('dx_l2_total', torch.tensor(0.0)).item(),
+            'dx_l2_outside': losses.get('dx_l2_outside', torch.tensor(0.0)).item(),
+            'dx_l2_inside': losses.get('dx_l2_inside', torch.tensor(0.0)).item(),
+            'dx_l2_outside_ratio': losses.get('dx_l2_outside_ratio', torch.tensor(0.0)).item(),
+            'dx_l1_total': losses.get('dx_l1_total', torch.tensor(0.0)).item(),
+            'dx_l1_outside': losses.get('dx_l1_outside', torch.tensor(0.0)).item(),
+            'dx_l1_inside': losses.get('dx_l1_inside', torch.tensor(0.0)).item(),
+            'dx_l1_outside_ratio': losses.get('dx_l1_outside_ratio', torch.tensor(0.0)).item(),
             'embed_orig_top': embedding_info['orig'][0],
             'embed_orig_mid': embedding_info['orig'][1],
             'embed_orig_bot': embedding_info['orig'][2],
@@ -839,7 +1225,7 @@ class ComprehensiveTrainer:
                 name = filenames[i] if filenames is not None else f"sample_{logged:03d}"
                 sanitized = self._sanitize_filename(str(name))
                 attr_list = [self.attr_names.index(attr_name) for attr_name in self.active_attr_names]
-                # attr_list = [self.attr_names.index('Mustache'),
+                # attr_list = [self.attr_names.index('Mouth_Slightly_Open'),
                 # ]
                 attr_idx = attr_list[logged % len(attr_list)]
                 target_labels = lbl.clone()
@@ -857,13 +1243,20 @@ class ComprehensiveTrainer:
                 with torch.no_grad():
                     probs = torch.sigmoid(self.model.classifier(img))
                     x_cf, _, _ = self.model(
-                        img, ig_batch, masks, target_labels, probs, attr_idx, hard=True
+                        img, ig_batch, masks, target_labels, probs, attr_idx, hard=False
                     )
+
+                # Note: blending is applied inside the generator in latent space when enabled.
 
                 # To numpy
                 def to_np(x):
                     x = x.detach().cpu().clamp(0, 1)
                     return x[0].permute(1, 2, 0).numpy()
+
+                # # Kiểm tra phạm vi pixel và điều chỉnh nếu cần
+                # # Kiểm tra phạm vi
+                # print(f"Image min/max before scaling: {img.min().item()}/{img.max().item()}")
+                # print(f"CF min/max before scaling: {x_cf.min().item()}/{x_cf.max().item()}")
 
                 orig_np = to_np((img + 1) * 0.5)  # nếu training ở [-1,1]; điều chỉnh nếu 0-1
                 cf_np = to_np((x_cf + 1) * 0.5)
@@ -905,7 +1298,7 @@ class ComprehensiveTrainer:
                 # Lưu ảnh gốc và cf riêng
                 orig_save_path = inference_dir / f"orig_epoch_{epoch:03d}_sample_{logged:03d}.png"
                 cf_save_path = inference_dir / f"cf_epoch_{epoch:03d}_sample_{logged:03d}.png"
-                plt.imsave(orig_save_path, orig_np)
+                # plt.imsave(orig_save_path, orig_np)
                 plt.imsave(cf_save_path, cf_np)
 
                 logged += 1
@@ -948,6 +1341,10 @@ class ComprehensiveTrainer:
                     attr_idx,
                     hard=True
                 )
+
+            if self.use_blend:
+                # Note: blending is applied inside the generator in latent space when enabled.
+                pass
 
             results['cfs'].append({
                 'image': x_cf.cpu(),

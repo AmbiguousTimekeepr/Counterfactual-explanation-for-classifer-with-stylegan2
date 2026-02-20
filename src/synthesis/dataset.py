@@ -6,6 +6,10 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 from PIL import Image
+import torch.multiprocessing as mp
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 
 
 SELECTED_ATTRIBUTES = [
@@ -207,7 +211,7 @@ class CelebADataset(Dataset):
             return image, attrs
 
 
-def get_loader(cfg, split='train', batch_size=None, num_workers=None, shuffle=None, return_filename=False):
+def get_loader(cfg, split='train', batch_size=None, num_workers=None, shuffle=None, return_filename=False,multiple_gpu=False):
     """
     Create a DataLoader for CelebA
     
@@ -227,6 +231,9 @@ def get_loader(cfg, split='train', batch_size=None, num_workers=None, shuffle=No
         num_workers = cfg.num_workers
     if shuffle is None:
         shuffle = (split == 'train')
+    if multiple_gpu:
+        # Adjust batch size for multiple GPUs
+        batch_size = max(batch_size * torch.cuda.device_count(), 1)
     
     dataset = CelebADataset(
         root_dir=cfg.data_root,
@@ -237,6 +244,12 @@ def get_loader(cfg, split='train', batch_size=None, num_workers=None, shuffle=No
         use_eval_partition=getattr(cfg, 'use_eval_partition', False)
     )
     
+    if multiple_gpu:
+        sampler = DistributedSampler(dataset, shuffle=shuffle)
+        shuffle = False  # Shuffle is handled by the sampler
+    else:
+        sampler = None
+
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -245,7 +258,8 @@ def get_loader(cfg, split='train', batch_size=None, num_workers=None, shuffle=No
         pin_memory=True,
         drop_last=(split == 'train'),
         persistent_workers=True if num_workers > 0 else False,
-        prefetch_factor=2 if num_workers > 0 else 0
+        prefetch_factor=2 if num_workers > 0 else 0,
+        sampler=sampler
     )
     
     return loader

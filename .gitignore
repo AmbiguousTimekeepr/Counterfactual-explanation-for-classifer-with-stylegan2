@@ -24,7 +24,32 @@ outputs/checkpoints_production/metrics_and_visualisations/metrics_history.csv
 #Exclude all script in the .gitignore current folder
 *.py
 !gui_counterfactual.py
+!src/readme_images/*.png
 *.png
 test.ipynb
 running_script copy.ipynb
 classifier_resnet18_cbam.ipynb
+*.jpg
+*.jpg:Zone.Identifier
+*.csv
+*.pdf
+*.tex
+*.pyc
+running_script copy 2.ipynb
+outputs/phase2_quantitative_eval
+outputs/phase3_ood
+outputs/phase3_sweep
+outputs/phase3_robustness_eval_smoke
+outputs/qualitative_eval
+outputs/recon_check
+outputs/validate_test
+outputs/inference_single_image
+outputs/inference_batch
+outputs/plots
+phase2_quantitative_eval.py
+qualitative_eval.py
+validate_test.py
+!inference.py
+!inference_batch.py
+*.csv
+*.txt

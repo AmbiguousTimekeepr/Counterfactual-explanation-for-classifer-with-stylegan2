@@ -1,6 +1,6 @@
 import argparse
 from pathlib import Path
-from ..latentspace.config import Config as VQVAEConfig
+from ..unsupervised_latentspace.config import Config as VQVAEConfig
 from .dataset import SELECTED_ATTRIBUTES
 
 

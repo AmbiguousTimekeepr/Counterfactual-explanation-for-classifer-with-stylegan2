@@ -35,3 +35,10 @@ Dataset/*
 **/*.pyc
 
 outputs/**/*.txt
+
+# exclude all .log files
+**/*.log
+
+# exclude all files in the outputs folder
+competitor_models/**/*
+outputs/**/*

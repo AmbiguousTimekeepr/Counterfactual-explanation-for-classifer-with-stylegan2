@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from ..unsupervised_latentspace.model import HVQVAE_3Level
+from ..latentspace.model import HVQVAE_3Level
 from ..classifiers.model import ResNet50_CBAM,ResNet18_CBAM
 from .latent_mutator import LatentMutator
 from .synthesis import HierarchicalSynthesisNet

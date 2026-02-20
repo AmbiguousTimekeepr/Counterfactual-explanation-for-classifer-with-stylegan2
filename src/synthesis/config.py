@@ -1,6 +1,6 @@
 import argparse
 from pathlib import Path
-from ..unsupervised_latentspace.config import Config as VQVAEConfig
+from ..latentspace.config import Config as VQVAEConfig
 from .dataset import SELECTED_ATTRIBUTES
 
 
@@ -16,19 +16,51 @@ class Config(VQVAEConfig):
         super().__init__()
         
         # ============================================================================
-        # Synthesis-Specific Training Hyperparameters
+        # Decoder Pretraining (runs first)
+        # ============================================================================
+        self.decoder_pretrain_epochs = 10
+        self.decoder_lr = 1e-3
+        self.decoder_betas = (0.0, 0.99)
+        self.decoder_checkpoint_dir = "outputs/synth_network/stylegan_decoder"
+        self.decoder_checkpoint_path = ""
+
+        # ============================================================================
+        # Decoder Sharpening (GAN finetune on recon fidelity)
+        # ============================================================================
+        self.sharpening_epochs = 15
+        self.g_sharpening_lr = 2e-4
+        self.d_sharpening_lr = 1e-5
+        self.sharpening_betas = (0.0, 0.99)
+        self.sharpening_checkpoint_dir = "outputs/synth_network/stylegan_decoder_sharpened"
+        self.sharpened_decoder_path = ""
+        self.sharpening_adv_weight = 1.0
+        self.sharpening_l1_weight = 1.0
+        self.sharpening_lpips_weight = 1.0
+        self.sharpening_fm_weight = 1.0
+        self.sharpening_r1_gamma = 10.0
+        self.sharpening_batch_size = 8
+        self.sharpening_max_batches = 0   # 0 = full epoch; set small for faster runs
+        self.sharpening_sample_size = 4   # samples saved each epoch
+
+        # ============================================================================
+        # Mutation / Counterfactual Training (comprehensive phase)
         # ============================================================================
         self.learning_rate = 1e-4          # Override: lower LR for fine-tuning
         self.weight_decay = 1e-5
         self.batch_size = 4                # Smaller batch for editing
         self.num_epochs = 50
         self.num_workers = 4
-        
+        self.adv_weight = 0.5
+        self.adv_r1_gamma = 0.0            # R1 regularization for main D (0 to disable)
+        self.grad_clip = 1.0               # Generator/mutator clipping
+        self.d_grad_clip = 1.0             # Discriminator clipping
+        self.use_amp = False               # Force full float32 for stability
+
         # ============================================================================
         # Model Paths (Pre-trained Checkpoints)
         # ============================================================================
-        self.vqvae_checkpoint = "outputs/checkpoints_production/checkpoints/checkpoint_step_22500.pth"
-        self.classifier_checkpoint = "outputs/cnn_classfier/best_model.pth"
+        self.vqvae_checkpoint = "outputs/latent_space/hrvqvae/checkpoints/best_gan.pth"
+        self.classifier_checkpoint = "outputs/classifier/checkpoints/resnet18_cbam_128_05_3/best_model.pth"
         self.data_root = "Dataset/celeba_70percent_721"
         
         # ============================================================================

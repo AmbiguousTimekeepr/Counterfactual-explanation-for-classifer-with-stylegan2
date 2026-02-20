@@ -164,26 +164,37 @@ class StyleGAN3Discriminator(nn.Module):
             if module.bias is not None:
                 nn.init.constant_(module.bias, 0)
     
-    def forward(self, x):
+    def forward(self, x, return_features: bool = False):
         """
         Forward pass through StyleGAN3 discriminator
         Args:
             x: Input images [B, 3, 64, 64]
+            return_features: If True, also return intermediate features for
+                feature-matching losses.
         Returns:
-            Discriminator logits [B, 1]
+            logits [B, 1] if return_features is False
+            (logits, feature_list) if return_features is True
         """
+        features = []
+
         # Progressive downsampling through blocks
         for block in self.blocks:
             x = block(x)
+            if return_features:
+                features.append(x)
         
         # Minibatch standard deviation
         if self.minibatch_std and self.training:
             x = self._minibatch_stddev(x)
+            if return_features:
+                features.append(x)
         
         # Final classification
         x = self.final_conv(x)  # [B, 1, 1, 1]
         x = x.view(x.size(0), -1)  # [B, 1]
         
+        if return_features:
+            return x, features
         return x
     
     def _minibatch_stddev(self, x):

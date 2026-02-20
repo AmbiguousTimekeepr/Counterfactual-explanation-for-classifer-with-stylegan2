@@ -170,12 +170,14 @@ class ComprehensiveTrainer:
         self.adv_weight = getattr(self.cfg, 'adv_weight', 0.5)
         print(f"Adversarial loss weight: {self.adv_weight}")
         
+        use_amp = bool(getattr(self.cfg, 'use_amp', False)) and torch.cuda.is_available()
         try:
             # Prefer newer torch.amp API when available
-            self.scaler = torch.amp.GradScaler("cuda", enabled=torch.cuda.is_available())
+            self.scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
         except TypeError:
             # Backward compatibility for older torch versions
-            self.scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
+            self.scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+        self.use_amp = use_amp
         self.decoder_pretrained = False
         sharpened_path = getattr(self.cfg, 'sharpened_decoder_path', '')
         decoder_ckpt_path = getattr(self.cfg, 'decoder_checkpoint_path', '')
@@ -822,13 +824,10 @@ class ComprehensiveTrainer:
         pbar = tqdm(loader, desc=f"Epoch {epoch} / {self.cfg.num_epochs}")
         # No gradient accumulation used — optimizer steps per batch.
         
-        # Disable decoder training for initial epochs if specified
-        # if epoch < 5:
-        #     for p in self.model.decoder.parameters():
-        #         p.requires_grad = False
-        # else:
-        #     for p in self.model.decoder.parameters():
-        #         p.requires_grad = True
+        attr_cycle = itertools.cycle(random.sample(self.active_attr_indices, self.attr_sample_size))
+        d_clip = getattr(self.cfg, 'd_grad_clip', 0.0) or 0.0
+        g_clip = getattr(self.cfg, 'grad_clip', 0.0) or 0.0
+        r1_gamma = getattr(self.cfg, 'adv_r1_gamma', 0.0) or 0.0
 
         attr_cycle = itertools.cycle(random.sample(self.active_attr_indices, self.attr_sample_size))
         for batch_idx, batch in enumerate(pbar):
@@ -919,14 +918,23 @@ class ComprehensiveTrainer:
                 # Blending now happens inside the generator in latent space; do not re-blend in pixel space.
                 pass
 
-            logits_real = self.discriminator(images)
+            real_imgs = images.detach().requires_grad_(r1_gamma > 0)
+            logits_real = self.discriminator(real_imgs)
             d_loss_real = F.relu(1.0 - logits_real).mean()
 
             logits_fake = self.discriminator(x_fake_detached)
             d_loss_fake = F.relu(1.0 + logits_fake).mean()
 
             d_loss = d_loss_real + d_loss_fake
+
+            if r1_gamma > 0:
+                grad_real = torch.autograd.grad(outputs=logits_real.sum(), inputs=real_imgs, create_graph=True)[0]
+                grad_penalty = grad_real.pow(2).view(grad_real.size(0), -1).sum(dim=1).mean()
+                d_loss = d_loss + (r1_gamma / 2.0) * grad_penalty
+
             d_loss.backward()
+            if d_clip > 0:
+                torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), d_clip)
             self.opt_d.step()
             disc_loss_value = d_loss.detach()
 
@@ -938,7 +946,7 @@ class ComprehensiveTrainer:
             # ====================================================
             # 2. Forward Pass (Curriculum Learning)
             # ====================================================
-            with autocast():
+            with autocast(enabled=self.use_amp):
                 x_new, z_mutated, step_values = self.model(
                     images,
                     ig_map,
@@ -1041,9 +1049,13 @@ class ComprehensiveTrainer:
                 
                 # Update progress bar
                 pbar.set_postfix({
-                    'loss': f"{losses['total'].item():.4f}",
+                    'total': f"{losses['total'].item():.4f}",
                     'cf': f"{losses['cf'].item():.3f}",
                     'ret': f"{losses['retention'].item():.3f}",
+                    'lat': f"{losses['latent_prox'].item():.3f}",
+                    'ortho': f"{losses['ortho'].item():.3f}",
+                    'sparse': f"{losses['sparse'].item():.4f}",
+                    'perc': f"{losses['perc'].item():.3f}",
                     'adv': f"{losses['adv'].item():.3f}",
                     'd': f"{losses['disc'].item():.3f}"
                 })
@@ -1400,9 +1412,9 @@ class ComprehensiveTrainer:
         self.model.decoder.train()
         optimizer = optim.Adam(self.model.decoder.parameters(), lr=decoder_lr, betas=decoder_betas)
         try:
-            scaler = torch.amp.GradScaler("cuda", enabled=torch.cuda.is_available())
+            scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
         except TypeError:
-            scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
+            scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
         l1_loss = torch.nn.L1Loss()
         lpips_loss = self.loss_manager.lpips
 
@@ -1421,7 +1433,7 @@ class ComprehensiveTrainer:
                     q_b, _, _ = self.model.vqvae.quant_b(self.model.vqvae.quant_conv_b(feat_b))
                     z_list = [q_t, q_m, q_b]
 
-                with autocast():
+                with autocast(enabled=self.use_amp):
                     recon = self.model.decoder(z_list)
                     loss_l1 = l1_loss(recon, images)
                     loss_lpips = lpips_loss(recon, images).mean()

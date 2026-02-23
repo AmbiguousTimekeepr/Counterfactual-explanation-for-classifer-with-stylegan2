@@ -4,8 +4,16 @@ Integrated Gradients Implementation
 import torch
 import cv2
 import numpy as np
-import matplotlib.pyplot as plt
 from PIL import Image
+
+
+try:
+    import matplotlib.pyplot as plt  # type: ignore
+
+    _HAS_MPL = True
+except Exception:
+    plt = None  # type: ignore
+    _HAS_MPL = False
 
 
 def integrated_gradients_batch(
@@ -112,6 +120,10 @@ def visualize_integrated_gradients(model, image_path, attribute_idx, attribute_n
         alpha: Overlay alpha
         image_size: Size of the image
     """
+    if not _HAS_MPL:
+        raise RuntimeError(
+            "matplotlib is required for visualize_integrated_gradients(), but it failed to import in this environment."
+        )
     # Load and preprocess image
     image = Image.open(image_path).convert("RGB")
     input_tensor = transform(image).unsqueeze(0).to(device)

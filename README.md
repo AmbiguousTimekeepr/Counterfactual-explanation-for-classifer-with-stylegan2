@@ -28,9 +28,13 @@ Weights and datasets are contained in the Dataset folder, extract and paste them
 ## Research Context
 
 This repository explores the intersection of **Explainable AI (XAI)** and **generative modeling** for producing interpretable explanations of classifier decisions.
+
 Specifically, the project investigates **counterfactual explanations** for image-based attribute classifiers. Instead of only highlighting important pixels, counterfactual explanations attempt to answer the question:
+
 "What minimal change to the input would alter the classifier’s prediction?"
+
 To explore this problem, the system combines a **latent-space generative model** with an **attribute classifier**, enabling targeted modifications in the latent representation of an image. These modifications are decoded into counterfactual images that flip a selected attribute while preserving as much of the original identity as possible.
+
 This repository serves as an experimental prototype studying how **latent space manipulation in generative models** can be used to produce **human-interpretable counterfactual explanations** for visual classifiers.
 
 ---

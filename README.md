@@ -1,10 +1,52 @@
 # Counterfactual Explanation for Attribute Classifiers (StyleGAN-like Decoder)
 
-This repository generates **counterfactual images** for a multi-attribute face classifier (CelebA subset). The goal is to flip one selected attribute (e.g., *Mouth Slightly Open*, *Eyeglasses*) while keeping other content as stable as possible, and to visualize *where* the classifier’s evidence comes from via saliency.
+This repository explores **counterfactual explanations for image classifiers** for a multi-attribute face classifier (CelebA subset). The goal is to flip a selected attribute (e.g., *Mouth Slightly Open*, *Eyeglasses*) while making minimal changes to the original image. 
+To guide the perturbation process, saliency methods are used to visualize where the classifier focuses when making its decision.
+
+The system combines:
+
+1. A multi-attribute face classifier
+2. Latent-space manipulation
+3. A StyleGAN-like decoder
+4. Explainability techniques (Integrated Gradients / saliency maps)
+
+The goal of this project is to answer the question:
+*"What is the smallest change needed in an image to change the classifier’s decision?"*
+
+The implementation is built around the CelebA attribute dataset and demonstrates attribute flipping such as:
+- Eyeglasses
+- Mouth slightly open
+- Hair color
+- Facial attributes
 
 If you only want to try inference quickly, start with the **GUI demo**: `gui_counterfactual.py`.
 
+Weights and datasets are contained in the Dataset folder, extract and paste them as provided according to the intruction.
+
 ---
+
+## Research Context
+
+This repository explores the intersection of **Explainable AI (XAI)** and **generative modeling** for producing interpretable explanations of classifier decisions.
+Specifically, the project investigates **counterfactual explanations** for image-based attribute classifiers. Instead of only highlighting important pixels, counterfactual explanations attempt to answer the question:
+"What minimal change to the input would alter the classifier’s prediction?"
+To explore this problem, the system combines a **latent-space generative model** with an **attribute classifier**, enabling targeted modifications in the latent representation of an image. These modifications are decoded into counterfactual images that flip a selected attribute while preserving as much of the original identity as possible.
+This repository serves as an experimental prototype studying how **latent space manipulation in generative models** can be used to produce **human-interpretable counterfactual explanations** for visual classifiers.
+
+---
+
+## Project Goals
+
+This repository demonstrates a small research prototype exploring:
+- Counterfactual explanation generation
+- Latent space manipulation for semantic attributes
+- Explainability techniques for attribute classifiers
+- Human-interpretable visual explanations
+
+The main objective is to produce counterfactual images that:
+1. **Flip a selected attribute**
+2. **Preserve identity and unrelated attributes**
+3. **Provide visual explanations of the classifier's attention**
 
 ## Results (What to Expect)
 
@@ -25,11 +67,16 @@ The typical output is a 3-panel figure:
 	 Suggested filename: docs/results_failure_case.png
 -->
 
-![Results (placeholder)](src/readme_images/image_3.png)
+![Results](src/readme_images/image_3.png)
 
 ---
+## Method and Pipeline Overview
 
-## Pipeline Overview
+Our counterfactual generation pipeline consist of these four components:
+1. Latent representation learning - The HR-VQVAE model learns a structured latent space representation of faces to have a general Knowledge Base (KB) of facial attributes. 
+2. Attribute classifier - A ResNet-based classifier predicts CelebA attributes, the model includes CBAM attention module and Integrated Gradients (IG) and an optional Grad-CAM++ option for experimentations.
+3. Latent mutation - A learned mutator network that modifies latent codes in order to flip a target attribute.
+4. Image reconstruction - A StyleGAN-like decoder reconstructs the counterfactual image from the modified latent code.
 
 Pipeline workflow:
 
@@ -157,7 +204,34 @@ outputs/                     # Checkpoints, logs, visualizations
 
 ---
 
+## Limitations
+
+This project is a research prototype, and several limitations remain:
+- Counterfactual edits may introduce artifacts
+- Some attributes are difficult to disentangle than others 
+- Identity preservation is only partially guaranteed
+- Performance depends on latent representation quality
+
+Future improvements could include:
+- Diffusion-based counterfactual generators
+- Completely disentangled latent spaces
+- Stronger identity preservation losses
+
+---
+
 ## Troubleshooting
 
 - **Dataset not found**: ensure `cfg.data_root` points to a folder containing `img_align_celeba/` and `list_attr_celeba.csv`.
 - **GUI can’t find checkpoints**: update the 4 path constants at the top of `gui_counterfactual.py`.
+
+---
+
+## References
+
+This project builds upon ideas from research on explainable AI, counterfactual explanations, and generative models.
+Relevant work includes:
+
+- Wachter et al., "Counterfactual Explanations without Opening the Black Box" (2017)
+- Selvaraju et al., "Grad-CAM: Visual Explanations from Deep Networks" (2017)
+- Kingma & Dhariwal, "Glow: Generative Flow with Invertible 1×1 Convolutions"
+- Karras et al., "Analyzing and Improving the Image Quality of StyleGAN" (2020)
